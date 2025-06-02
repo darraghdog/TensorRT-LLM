@@ -276,6 +276,9 @@ def hf_redrafter_config(
                 redrafter_exclude_modules += [f'drafter.layers.{lyrnum}', f'drafter.layers.{lyrnum}.linear']
             tllm_config.quantization.exclude_modules += redrafter_exclude_modules
 
+    # Align type to drafter type for gemm plugin
+    if tllm_config.dtype == 'bfloat16':
+        tllm_config.dtype = 'float16'
 
     return tllm_config
 
@@ -303,10 +306,6 @@ def convert_and_save(
 
     model_config = PretrainedConfig.from_json_file(config_path)
     model_config = copy.deepcopy(model_config)
-
-    # Align type to drafter type for gemm plugin
-    if model_config.dtype == 'bfloat16':
-        model_config.dtype = 'float16'
 
     # Prepare rank-specific configuration
     rank_config = copy.deepcopy(model_config)
