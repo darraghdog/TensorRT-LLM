@@ -303,7 +303,8 @@ def convert_and_save(
 
     model_config = PretrainedConfig.from_json_file(config_path)
     model_config = copy.deepcopy(model_config)
-    setattr(model_config, "float16", model_config.dtype == "bfloat16")
+    if model_config.dtype == 'bfloat16':
+        setattr(model_config, "float16", dtype)
 
     # Prepare rank-specific configuration
     rank_config = copy.deepcopy(model_config)
