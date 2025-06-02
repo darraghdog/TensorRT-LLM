@@ -388,7 +388,8 @@ def create_and_save_config(args):
     #     mapping=mapping,
     # )
 
-    rank = 0
+    # rank = 0
+    hf_base_model_dir = args.model_dir
     config_path = os.path.join(hf_base_model_dir, 'config.json')
     model_config = PretrainedConfig.from_json_file(config_path)
     tllm_model_config = copy.deepcopy(model_config)
