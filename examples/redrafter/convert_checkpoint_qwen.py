@@ -22,6 +22,7 @@ from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional
+from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 
 import safetensors
 import torch
@@ -34,7 +35,10 @@ import tensorrt_llm.models.modeling_utils
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.qwen.convert import convert_hf_qwen
-
+from tensorrt_llm.models.llama.convert import (dup_kv_weight,
+                                               get_tllm_linear_weight,
+                                               get_weight, get_weight_and_bias,
+                                               split)
 
 BASE_MODEL_TLLM_WEIGHT_PREFIX = "base_model."
 DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
@@ -128,6 +132,116 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def hf_drafter(
+    hf_model: Namespace,  #DrafterModel, # TODO:
+    mapping: Mapping,
+    dtype: torch.dtype = torch.float32,
+    additional_tllm_prefix: str = "",
+) -> Dict[str, torch.Tensor]:
+    """
+    Possible tensor names for Drafter checkpoints:
+        input_proj.weight
+        input_proj.bias
+        lm_head.0.linear.weight
+        lm_head.0.linear.bias
+        lm_head.1.linear.weight
+        lm_head.1.linear.bias
+        lm_head.2.weight
+        rnn_u.weight
+        rnn_u.bias
+        rnn_w.weight
+
+        OR
+
+        input_projs.weight
+        input_projs.bias
+        lm_heads.0.linear.weight
+        lm_heads.0.linear.bias
+        lm_heads.1.linear.weight
+        lm_heads.1.linear.bias
+        lm_heads.2.weight
+
+        OR
+
+        0.0.linear.weight
+        0.0.linear.bias
+        0.1.linear.weight
+        0.1.linear.bias
+        0.2.weight
+
+    """
+
+    def get_weight_and_bias_with_multiple_possible_names(
+            model_params, dtype, names_to_try, bias=True):
+        w, b = None, None
+        for name in names_to_try:
+            try:
+                if bias:
+                    w, b = get_weight_and_bias(model_params, name, dtype)
+                else:
+                    w = get_weight(model_params, name, dtype)
+                break
+            except:
+                pass
+        if not bias:
+            return w
+        return w, b
+
+    weights = {}
+    # TODO: When ReDrafter is added to Transformers
+    # model_params = dict(hf_model.named_parameters())
+    model_params = dict(hf_model.named_parameters)
+
+    if hf_model.config.hidden_size * 2 != hf_model.config.exit_dim:
+        input_proj_weight, input_proj_bias = get_weight_and_bias_with_multiple_possible_names(
+            model_params, dtype, ["input_proj", "input_projs"])
+        weights[f"{additional_tllm_prefix}input_proj.weight"] = split(
+            input_proj_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+        weights[f"{additional_tllm_prefix}input_proj.bias"] = split(
+            input_proj_bias, mapping.tp_size, mapping.tp_rank, dim=0)
+
+    for layer_idx in range(hf_model.config.num_draft_layers):
+        layer_weight, layer_bias = get_weight_and_bias_with_multiple_possible_names(
+            model_params, dtype, [
+                f"lm_head.{layer_idx}.linear", f"lm_heads.{layer_idx}.linear",
+                f"0.{layer_idx}.linear"
+            ])
+        weights[
+            f"{additional_tllm_prefix}layers.{layer_idx}.linear.weight"] = split(
+                layer_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+        weights[
+            f"{additional_tllm_prefix}layers.{layer_idx}.linear.bias"] = split(
+                layer_bias, mapping.tp_size, mapping.tp_rank, dim=0)
+
+    last_layer_weight = get_weight_and_bias_with_multiple_possible_names(
+        model_params,
+        dtype, [
+            f"lm_head.{hf_model.config.num_draft_layers}",
+            f"lm_heads.{hf_model.config.num_draft_layers}",
+            f"0.{hf_model.config.num_draft_layers}"
+        ],
+        bias=False)
+    weights[f"{additional_tllm_prefix}lm_head.weight"] = split(
+        last_layer_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+
+    if hf_model.config.rnn:
+        # rnn_u has both weight and bias
+        rnn_u_weight, rnn_u_bias = get_weight_and_bias(model_params, "rnn_u",
+                                                       dtype)
+        weights[f"{additional_tllm_prefix}rnn_u.weight"] = split(
+            rnn_u_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+        weights[f"{additional_tllm_prefix}rnn_u.bias"] = split(rnn_u_bias,
+                                                               mapping.tp_size,
+                                                               mapping.tp_rank,
+                                                               dim=0)
+
+        # rnn_w only has weight
+        rnn_w_weight = get_weight(model_params, "rnn_w", dtype)
+        weights[f"{additional_tllm_prefix}rnn_w.weight"] = split(
+            rnn_w_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+
+    return weights
+
 def hf_qwen2_config(
     hf_config: Qwen2Config,
     dtype: str = "float32",
@@ -186,35 +300,30 @@ def hf_redrafter_config(
 def convert_and_save(
     rank: int,
     tp_size: int,
-    hf_base_model: Qwen2ForCausalLM,
+    hf_base_model_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
     embedding_sharding_dim: int,
     output_dir: str,
 ) -> None:
+
     mapping = Mapping(
         world_size=tp_size,
         rank=rank,
         tp_size=tp_size,
     )
-    weights =  convert_hf_qwen2(
-        hf_base_model,
-        mapping,
-        rank,
-        dtype=dtype,
-        use_parallel_embedding=use_parallel_embedding,
-        sharding_dim=embedding_sharding_dim,
-        # use_weight_only=args.use_weight_only,
-        # plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-        # use_smooth_quant=args.smoothquant,
-        # per_channel=args.per_channel,
-        # per_token=args.per_token,
-        # int8_kv_cache=args.int8_kv_cache,
-        # act_range=convert_args['act_range'],
-        # qkv_para=convert_args['llama_qkv_para'],
-        # smoother=convert_args['llama_smoother']
-    )
+
+    rank = 0
+    config_path = os.path.join(hf_base_model_dir, 'config.json')
+    model_config = PretrainedConfig.from_json_file(config_path)
+    model_config = copy.deepcopy(model_config)
+    rank_config = copy.deepcopy(model_config)
+    rank_config.set_rank(rank)
+    architecture = model_config.architecture
+    model_cls = MODEL_MAP[architecture]
+    hf_base_model = model_cls.from_checkpoint(hf_base_model_dir, config=rank_config)
+    weights = {k:v.shape for k,v in hf_base_model.named_parameters()}
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
@@ -233,7 +342,7 @@ def convert_and_save(
 def multi_worker_convert_and_save(
     workers: int,
     tp_size: int,
-    hf_base_model: Qwen2ForCausalLM,
+    hf_base_model_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
@@ -246,7 +355,7 @@ def multi_worker_convert_and_save(
                 convert_and_save,
                 rank,
                 tp_size,
-                hf_base_model,
+                hf_base_model_dir,
                 hf_drafter_model,
                 dtype,
                 use_parallel_embedding,
@@ -297,16 +406,20 @@ def create_and_save_config(args):
     return drafter_hf_config
 
 
+
 def main():
     args = parse_arguments()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     drafter_hf_config = create_and_save_config(args)
 
-    hf_base_model = Qwen2ForCausalLM.from_pretrained(
-        args.model_dir,
-        torch_dtype="auto",
-    )
+    hf_base_model_dir = args.model_dir
+
+
+    #hf_base_model = Qwen2ForCausalLM.from_pretrained(
+    #    args.model_dir,
+    #    torch_dtype="auto",
+    #)
 
     hf_drafter_model: Optional[AutoModel] = None
     if args.drafter_model_dir:
@@ -336,7 +449,7 @@ def main():
     multi_worker_convert_and_save(
         args.workers,
         args.tp_size,
-        hf_base_model,
+        hf_base_model_dir,
         hf_drafter_model,
         args.dtype,
         args.use_parallel_embedding,
