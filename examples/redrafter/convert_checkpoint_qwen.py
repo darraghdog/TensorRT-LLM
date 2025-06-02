@@ -294,18 +294,18 @@ def hf_redrafter_config(
             redrafter_draft_len_per_beam)
     setattr(tllm_config, "redrafter_greedy_search", redrafter_greedy_search)
 
-    # Exclude the redrafter weights from ay quantisation
-    if "quantization" in tllm_config:
-        if "exclude_modules" in tllm_config["quantization"]:
-
-            redrafter_exclude_modules =  ['drafter', 'drafter.layers', 'drafter.lm_head']
-            num_redrafter_layers = tllm_config["redrafter_num_layers"]
-            if tllm_config["redrafter_is_rnn"] :
+    # Exclude the redrafter weights from any quantisation
+    if hasattr(tllm_config, "quantization") and tllm_config.quantization is not None:
+        # If quantization is an object/namespace, handle it accordingly
+        if hasattr(tllm_config.quantization, "exclude_modules"):
+            redrafter_exclude_modules = ['drafter', 'drafter.layers', 'drafter.lm_head']
+            num_redrafter_layers = tllm_config.redrafter_num_layers
+            if tllm_config.redrafter_is_rnn:
                 redrafter_exclude_modules += ['drafter.rnn_u', 'drafter.rnn_w']
             for lyrnum in range(num_redrafter_layers):
                 redrafter_exclude_modules += [f'drafter.layers.{lyrnum}', f'drafter.layers.{lyrnum}.linear']
+            tllm_config.quantization.exclude_modules += redrafter_exclude_modules
 
-            tllm_config["quantization"]["exclude_modules"] += redrafter_exclude_modules
 
     return tllm_config
 
