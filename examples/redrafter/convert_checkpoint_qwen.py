@@ -249,7 +249,7 @@ def hf_redrafter_config(
     tllm_config = copy.deepcopy(tllm_base_model_config)
 
     tllm_config.base_model_architecture = tllm_config.architecture
-    tllm_config.architecture = "ReDrafterForQWenLM"
+    tllm_config.architecture = "ReDrafterForCausalLM"
     setattr(tllm_config, "redrafter_num_layers",
             drafter_config.num_draft_layers)
     setattr(tllm_config, "redrafter_hidden_size", drafter_config.hidden_size)
