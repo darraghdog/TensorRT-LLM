@@ -453,8 +453,17 @@ def main():
             "config": drafter_hf_config
         })
 
-    multi_worker_convert_and_save(
-        args.workers,
+    # multi_worker_convert_and_save(
+    #     args.workers,
+    #     args.tp_size,
+    #     hf_base_model_dir,
+    #     hf_drafter_model,
+    #     args.dtype,
+    #     args.use_parallel_embedding,
+    #     args.embedding_sharding_dim,
+    #     args.output_dir,
+    # )
+    convert_and_save(
         args.tp_size,
         hf_base_model_dir,
         hf_drafter_model,
