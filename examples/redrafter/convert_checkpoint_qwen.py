@@ -301,7 +301,7 @@ def convert_and_save(
     config_path = os.path.join(hf_base_model_dir, 'config.json')
     stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
 
-    model_config = PretrainedConfig.from_json_file(config_path, dtype = '')
+    model_config = PretrainedConfig.from_json_file(config_path)
     model_config = copy.deepcopy(model_config)
 
     # Align type to drafter type for gemm plugin
