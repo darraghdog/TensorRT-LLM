@@ -381,12 +381,17 @@ def create_and_save_config(args):
         tp_size=args.tp_size,
         pp_size=1,
     )
-    base_model_hf_config = AutoConfig.from_pretrained(args.model_dir)
-    tllm_model_config = hf_qwen2_config(
-        base_model_hf_config,
-        dtype=args.dtype,
-        mapping=mapping,
-    )
+    # base_model_hf_config = AutoConfig.from_pretrained(args.model_dir)
+    # tllm_model_config = hf_qwen2_config(
+    #     base_model_hf_config,
+    #     dtype=args.dtype,
+    #     mapping=mapping,
+    # )
+
+    rank = 0
+    config_path = os.path.join(hf_base_model_dir, 'config.json')
+    model_config = PretrainedConfig.from_json_file(config_path)
+    tllm_model_config = copy.deepcopy(model_config)
 
     if args.drafter_model_dir:
         # TODO: When ReDrafter is added to Transformers
@@ -411,6 +416,7 @@ def main():
     args = parse_arguments()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
     drafter_hf_config = create_and_save_config(args)
 
     hf_base_model_dir = args.model_dir
