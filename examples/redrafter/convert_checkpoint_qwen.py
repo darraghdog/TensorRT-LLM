@@ -464,6 +464,7 @@ def main():
     #     args.output_dir,
     # )
     convert_and_save(
+        rank = 0,
         args.tp_size,
         hf_base_model_dir,
         hf_drafter_model,
