@@ -463,16 +463,18 @@ def main():
     #     args.embedding_sharding_dim,
     #     args.output_dir,
     # )
-    convert_and_save(
-        rank = 0,
-        args.tp_size,
-        hf_base_model_dir,
-        hf_drafter_model,
-        args.dtype,
-        args.use_parallel_embedding,
-        args.embedding_sharding_dim,
-        args.output_dir,
-    )
+
+    for rank in range(args.tp_size):
+        convert_and_save(
+            rank,
+            args.tp_size,
+            hf_base_model_dir,
+            hf_drafter_model,
+            args.dtype,
+            args.use_parallel_embedding,
+            args.embedding_sharding_dim,
+            args.output_dir,
+        )
 
 
 if __name__ == "__main__":
