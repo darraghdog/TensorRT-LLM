@@ -324,8 +324,6 @@ def convert_and_save(
     model_cls = MODEL_MAP[architecture]
     hf_base_model = model_cls.from_checkpoint(hf_base_model_dir, config=rank_config)
     weights = {k:v.shape for k,v in hf_base_model.named_parameters()}
-    weights_dict = "\n".join([f'{k} :{v.shape}' for k,v in hf_base_model.named_parameters()])
-    print(f'hf_base_model : {weights_dict}')
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
@@ -337,7 +335,12 @@ def convert_and_save(
         )
         weights.update(drafter_weights)
 
-    drafter_weights_dict = "\n".join([f'{k} :{v.shape}' for k,v in drafter_weights.items()])
+    print(type(hf_base_model))
+    print(type(weights))
+    print(type(drafter_weights))
+    weights_dict = "\n".join([f'{k} : {v.shape} {v.dtype}' for k,v in hf_base_model.named_parameters()])
+    print(f'hf_base_model : {weights_dict}')
+    drafter_weights_dict = "\n".join([f'{k} :{v.shape} {v.dtype}' for k,v in drafter_weights.items()])
     print(f'Drafter weights : {drafter_weights_dict}')
     safetensors.torch.save_file(
         weights, os.path.join(output_dir, f"rank{rank}.safetensors"))
