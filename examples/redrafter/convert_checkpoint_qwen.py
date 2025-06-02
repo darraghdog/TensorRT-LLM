@@ -297,14 +297,26 @@ def convert_and_save(
         tp_size=tp_size,
     )
 
+    # Load model configuration
     config_path = os.path.join(hf_base_model_dir, 'config.json')
     stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
+
     model_config = PretrainedConfig.from_json_file(config_path)
     model_config = copy.deepcopy(model_config)
+
+    # Prepare rank-specific configuration
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
+
+    # Load and prepare weights
     weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
-    weights = {k:weights_safe.get_tensor(k) for k in weights_safe.keys()}
+    weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
+
+    # Convert bfloat16 tensors if needed
+    weights = {
+        k: v if not type(v) is torch.bfloat16 else v.to(torch.bfloat16)
+        for k, v in weights.items()
+    }
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
