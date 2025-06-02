@@ -338,9 +338,9 @@ def convert_and_save(
     print(type(hf_base_model))
     print(type(weights))
     print(type(drafter_weights))
-    weights_dict = "\n".join([f'{k} : {v.shape} {v.dtype}' for k,v in hf_base_model.named_parameters()])
+    weights_dict = "\n".join([f'{k} : {v.shape} {v.dtype} {type(v)}' for k,v in hf_base_model.named_parameters()])
     print(f'hf_base_model : {weights_dict}')
-    drafter_weights_dict = "\n".join([f'{k} :{v.shape} {v.dtype}' for k,v in drafter_weights.items()])
+    drafter_weights_dict = "\n".join([f'{k} :{v.shape} {v.dtype} {type(v)}' for k,v in drafter_weights.items()])
     print(f'Drafter weights : {drafter_weights_dict}')
     safetensors.torch.save_file(
         weights, os.path.join(output_dir, f"rank{rank}.safetensors"))
