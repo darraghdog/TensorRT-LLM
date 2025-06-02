@@ -24,9 +24,9 @@ import tensorrt as trt
 from tensorrt_llm._common import default_net
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import Tensor, cast, categorical_sample
-from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models import LLaMAForCausalLM, QWenForCausalLM
 from tensorrt_llm.models.generation_mixin import GenerationMixin
+from tensorrt_llm.models import MODEL_MAP
 
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from .drafter import Drafter
