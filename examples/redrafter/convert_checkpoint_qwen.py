@@ -315,18 +315,13 @@ def convert_and_save(
     )
 
     config_path = os.path.join(hf_base_model_dir, 'config.json')
+    stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
     model_config = PretrainedConfig.from_json_file(config_path)
     model_config = copy.deepcopy(model_config)
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
-    # architecture = model_config.architecture
-    # model_cls = MODEL_MAP[architecture]
-    # hf_base_model = model_cls.from_checkpoint(hf_base_model_dir, config=rank_config)
-    # weights = {k:v.shape for k,v in hf_base_model.named_parameters()}
-
-    weights_safe = safetensors.safe_open(f"{hf_base_model_dir}/rank0.safetensors", framework="pt")
+    weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
     weights = {k:weights_safe.get_tensor(k) for k in weights_safe.keys()}
-
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
@@ -338,13 +333,6 @@ def convert_and_save(
         )
         weights.update(drafter_weights)
 
-    # print(type(hf_base_model))
-    print(type(weights))
-    print(type(drafter_weights))
-    weights_dict = "\n".join([f'{k} : {v.shape} {v.dtype} {type(v)}' for k,v in weights.items()])
-    print(f'hf_base_model : {weights_dict}')
-    drafter_weights_dict = "\n".join([f'{k} :{v.shape} {v.dtype} {type(v)}' for k,v in drafter_weights.items()])
-    print(f'Drafter weights : {drafter_weights_dict}')
     safetensors.torch.save_file(
         weights, os.path.join(output_dir, f"rank{rank}.safetensors"))
 
