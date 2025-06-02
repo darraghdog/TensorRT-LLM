@@ -301,10 +301,12 @@ def convert_and_save(
     config_path = os.path.join(hf_base_model_dir, 'config.json')
     stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
 
-    model_config = PretrainedConfig.from_json_file(config_path)
+    model_config = PretrainedConfig.from_json_file(config_path, dtype = '')
     model_config = copy.deepcopy(model_config)
+
+    # Align type to drafter type for gemm plugin
     if model_config.dtype == 'bfloat16':
-        setattr(model_config, "float16", dtype)
+        model_config.dtype = 'float16'
 
     # Prepare rank-specific configuration
     rank_config = copy.deepcopy(model_config)
