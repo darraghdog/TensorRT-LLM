@@ -42,6 +42,7 @@ class ReDrafterMixin:
         self.vocab_size = config.vocab_size
         vocab_size_padded = pad_vocab_size(self.vocab_size,
                                            config.mapping.tp_size)
+        print(config)
         self.drafter = Drafter.from_config(config, vocab_size_padded)
         self.num_beams = config.redrafter_num_beams
         self.beam_candidate_length = config.redrafter_draft_len_per_beam
