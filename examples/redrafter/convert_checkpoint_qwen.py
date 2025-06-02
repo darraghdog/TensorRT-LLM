@@ -324,8 +324,8 @@ def convert_and_save(
     model_cls = MODEL_MAP[architecture]
     hf_base_model = model_cls.from_checkpoint(hf_base_model_dir, config=rank_config)
     weights = {k:v.shape for k,v in hf_base_model.named_parameters()}
-    weights_dict = "\n".join([f'{k} :{v.shape}' for k,v in weights.named_parameters()])
-    print(f'Base weights : {weights_dict}')
+    weights_dict = "\n".join([f'{k} :{v.shape}' for k,v in hf_base_model.named_parameters()])
+    print(f'hf_base_model : {weights_dict}')
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
