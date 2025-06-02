@@ -337,7 +337,7 @@ def convert_and_save(
         )
         weights.update(drafter_weights)
 
-    drafter_weights_dict = "\n".join([f'{k} :{v.shape}' for k,v in drafter_weights.named_parameters()])
+    drafter_weights_dict = "\n".join([f'{k} :{v.shape}' for k,v in drafter_weights.items()])
     print(f'Drafter weights : {drafter_weights_dict}')
     safetensors.torch.save_file(
         weights, os.path.join(output_dir, f"rank{rank}.safetensors"))
