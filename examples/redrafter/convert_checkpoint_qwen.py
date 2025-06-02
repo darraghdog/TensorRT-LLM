@@ -338,7 +338,7 @@ def convert_and_save(
         )
         weights.update(drafter_weights)
 
-    print(type(hf_base_model))
+    # print(type(hf_base_model))
     print(type(weights))
     print(type(drafter_weights))
     weights_dict = "\n".join([f'{k} : {v.shape} {v.dtype} {type(v)}' for k,v in hf_base_model.named_parameters()])
