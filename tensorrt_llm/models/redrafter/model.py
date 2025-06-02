@@ -27,7 +27,6 @@ from tensorrt_llm.functional import Tensor, cast, categorical_sample
 from tensorrt_llm.models import LLaMAForCausalLM, QWenForCausalLM
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 
-from .. import MODEL_MAP
 from ..._utils import pad_vocab_size, str_dtype_to_trt
 from .drafter import Drafter
 from .redrafter_helper import (_beam_search_candidates, _beams2tree,
@@ -309,7 +308,15 @@ class ReDrafterForCausalLM:
         base_model_name = config.base_model_architecture
 
         # Get the actual class name
-        actual_class_name = MODEL_MAP.get(base_model_name, base_model_name)
+        # Map config architecture names to actual TensorRT-LLM class names
+        model_mapping = {
+            'Qwen2ForCausalLM': 'QWenForCausalLM',
+            'QwenForCausalLM': 'QWenForCausalLM',
+            'LlamaForCausalLM': 'LLaMAForCausalLM',
+            'LLaMAForCausalLM': 'LLaMAForCausalLM',
+            # Add more redrafter mappings as needed
+        }
+        actual_class_name = model_mapping.get(base_model_name, base_model_name)
 
         # Dynamically import the base model class
         from tensorrt_llm import models
