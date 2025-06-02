@@ -317,7 +317,7 @@ def convert_and_save(
 
     # Convert bfloat16 tensors if needed
     weights = {
-        k: v if not type(v) is torch.bfloat16 else v.to(torch.bfloat16)
+        k: v if not type(v) is torch.bfloat16 else v.to(torch.float16)
         for k, v in weights.items()
     }
 
