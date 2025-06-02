@@ -28,13 +28,10 @@ import safetensors
 import torch
 from transformers.models.auto import AutoModel
 from transformers.models.auto.configuration_auto import AutoConfig
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
 import tensorrt_llm.models.modeling_utils
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.qwen.convert import convert_hf_qwen
 from tensorrt_llm.models.llama.convert import (dup_kv_weight,
                                                get_tllm_linear_weight,
                                                get_weight, get_weight_and_bias,
@@ -242,33 +239,6 @@ def hf_drafter(
 
     return weights
 
-def hf_qwen2_config(
-    hf_config: Qwen2Config,
-    dtype: str = "float32",
-    logits_dtype: str = "float32",
-    mapping: Mapping = Mapping(1),
-) -> tensorrt_llm.models.modeling_utils.PretrainedConfig:
-    return tensorrt_llm.models.modeling_utils.PretrainedConfig(
-        architecture="Qwen2ForCausalLM",
-        dtype=dtype,
-        logits_dtype=logits_dtype,
-        vocab_size=hf_config.vocab_size,
-        max_position_embeddings=hf_config.max_position_embeddings,
-        hidden_size=hf_config.hidden_size,
-        num_hidden_layers=hf_config.num_hidden_layers,
-        num_attention_heads=hf_config.num_attention_heads,
-        num_key_value_heads=hf_config.num_key_value_heads,
-        hidden_act=hf_config.hidden_act,
-        intermediate_size=hf_config.intermediate_size,
-        norm_epsilon=hf_config.rms_norm_eps,
-        position_embedding_type="rope_gpt_neox",
-        mapping=mapping,
-        quantization=tensorrt_llm.models.modeling_utils.QuantConfig(),
-        rotary_base=getattr(hf_config, "rope_theta", 10000.0),
-        rotary_scaling=getattr(hf_config, "rope_scaling", None),
-    )
-
-
 def hf_redrafter_config(
     tllm_base_model_config: tensorrt_llm.models.modeling_utils.PretrainedConfig,
     drafter_config: Namespace,  # DrafterConfig
@@ -279,7 +249,7 @@ def hf_redrafter_config(
     tllm_config = copy.deepcopy(tllm_base_model_config)
 
     tllm_config.base_model_architecture = tllm_config.architecture
-    tllm_config.architecture = "ReDrafterForQWenLM"
+    tllm_config.architecture = f"{tllm_config.base_model_architecture}ReDrafter"
     setattr(tllm_config, "redrafter_num_layers",
             drafter_config.num_draft_layers)
     setattr(tllm_config, "redrafter_hidden_size", drafter_config.hidden_size)
@@ -431,14 +401,7 @@ def main():
         os.makedirs(args.output_dir)
 
     drafter_hf_config = create_and_save_config(args)
-
     hf_base_model_dir = args.model_dir
-
-
-    #hf_base_model = Qwen2ForCausalLM.from_pretrained(
-    #    args.model_dir,
-    #    torch_dtype="auto",
-    #)
 
     hf_drafter_model: Optional[AutoModel] = None
     if args.drafter_model_dir:
