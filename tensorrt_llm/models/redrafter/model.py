@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import importlib
+import json
+from typing import Type
 from collections import OrderedDict
 
 import tensorrt as trt
@@ -20,6 +24,7 @@ import tensorrt as trt
 from tensorrt_llm._common import default_net
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import Tensor, cast, categorical_sample
+from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models import LLaMAForCausalLM, QWenForCausalLM
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 
@@ -297,10 +302,29 @@ class ReDrafterMixin:
         inputs['position_ids_base'] = position_ids_base
         return inputs
 
+class ReDrafterForCausalLM:
+    def __new__(cls, config):
+        # Get base model architecture from config
+        base_model_name = config.base_model_architecture
 
-class ReDrafterForQWenLM(ReDrafterMixin, QWenForCausalLM):
-    pass  # Inherits drafting logic from mixin + QWen backbone
+        # Get the actual class name
+        actual_class_name = MODEL_MAP.get(base_model_name, base_model_name)
 
-class ReDrafterForCausalLM(ReDrafterMixin, LLaMAForCausalLM):
-    pass  # Same logic, different base model
+        # Dynamically import the base model class
+        from tensorrt_llm import models
+        try:
+            base_model_class = getattr(models, actual_class_name)
+        except AttributeError:
+            raise ValueError(f"Unknown base model architecture: {base_model_name} (mapped to {actual_class_name})")
 
+        # Create a dynamic class that inherits from both ReDrafterMixin and the base model
+        DynamicReDrafterClass = type(
+            'ReDrafterForCausalLM',  # Always use this name
+            (ReDrafterMixin, base_model_class),
+            {
+                '__module__': cls.__module__,  # Preserve module info
+            }
+        )
+
+        # Create and return an instance of the dynamic class
+        return DynamicReDrafterClass(config)
