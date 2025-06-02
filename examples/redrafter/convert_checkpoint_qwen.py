@@ -294,6 +294,19 @@ def hf_redrafter_config(
             redrafter_draft_len_per_beam)
     setattr(tllm_config, "redrafter_greedy_search", redrafter_greedy_search)
 
+    # Exclude the redrafter weights from ay quantisation
+    if "quantization" in tllm_config:
+        if "exclude_modules" in tllm_config["quantization"]:
+
+            redrafter_exclude_modules =  ['drafter', 'drafter.layers', 'drafter.lm_head']
+            num_redrafter_layers = tllm_config["redrafter_num_layers"]
+            if tllm_config["redrafter_is_rnn"] :
+                redrafter_exclude_modules += ['drafter.rnn_u', 'drafter.rnn_w']
+            for lyrnum in range(num_redrafter_layers):
+                redrafter_exclude_modules += [f'drafter.layers.{lyrnum}', f'drafter.layers.{lyrnum}.linear']
+
+            tllm_config["quantization"]["exclude_modules"] += redrafter_exclude_modules
+
     return tllm_config
 
 
@@ -404,6 +417,7 @@ def create_and_save_config(args):
             redrafter_draft_len_per_beam=args.redrafter_draft_len_per_beam,
             redrafter_greedy_search=args.redrafter_greedy_search,
         )
+
 
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(tllm_model_config.to_dict(), f, indent=4)
