@@ -1,0 +1,15 @@
+git clone --branch v1.0.0rc1 https://github.com/NVIDIA/TensorRT-LLM
+cd TensorRT-LLM
+
+docker build \
+    --build-arg BASE_IMAGE=nvcr.io/nvidia/cuda \
+    --build-arg BASE_TAG=12.5.0-devel-rockylinux8 \
+    --build-arg PYTHON_VERSION=3.11.11 \
+    -t trtllm:wheel \
+    -f Dockerfile18b.multi \
+    --target wheel \
+    .
+  
+docker create --name wheel_tmp trtllm:wheel
+docker cp wheel_tmp:/wheel_out/.  ./wheel_from_docker   # keeps original names
+docker rm wheel_tmp
