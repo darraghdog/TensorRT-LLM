@@ -660,12 +660,70 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     opt = {"value_layout": value_layout, "value_layout_opts": value_layout_opts, \
             "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
 
-    # w, w_scale = downcast_to_mxfp(tensor.to(torch.bfloat16), torch.uint8, axis=1)
-    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
-                       **opt["value_layout_opts"])
-    w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"],
-                             **opt["scale_layout_opts"])
-    return w, w_scale
+    # Process experts in chunks to reduce peak GPU memory
+    # This avoids OOM in convert_layout which creates intermediate tensors
+    num_experts = w.shape[0]
+    if num_experts == 0:
+        # Handle edge case of zero experts
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
+                           **opt["value_layout_opts"])
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"],
+                                 **opt["scale_layout_opts"])
+        return w, w_scale
+
+    try:
+        chunk_size = int(os.getenv("TRITON_MOE_FP4_SWIZZLE_CHUNK", 8))
+    except (ValueError, TypeError):
+        chunk_size = 8
+    chunk_size = max(1, min(chunk_size, num_experts))
+
+    w_out = None
+    w_scale_out = None
+
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+
+        # Extract chunk and make contiguous
+        w_chunk = w[start:end].contiguous()
+        w_scale_chunk = w_scale[start:end].contiguous()
+
+        # Convert layout for this chunk
+        w_chunk_converted = convert_layout(
+            wrap_torch_tensor(w_chunk, dtype=FP4),
+            opt["value_layout"], **opt["value_layout_opts"])
+        w_scale_chunk_converted = convert_layout(
+            wrap_torch_tensor(w_scale_chunk),
+            opt["scale_layout"], **opt["scale_layout_opts"])
+
+        # Allocate output buffers on first chunk
+        if w_out is None:
+            w_out_shape = (num_experts,) + w_chunk_converted.storage.data.shape[1:]
+            w_out_data = torch.empty(
+                w_out_shape,
+                dtype=w_chunk_converted.storage.data.dtype,
+                device=w_chunk_converted.storage.data.device)
+            # Wrap with same dtype/layout - convert_layout already applied the layout
+            w_out = wrap_torch_tensor(w_out_data, dtype=FP4)
+            w_out.layout = w_chunk_converted.layout
+
+            w_scale_out_shape = (num_experts,) + w_scale_chunk_converted.storage.data.shape[1:]
+            w_scale_out_data = torch.empty(
+                w_scale_out_shape,
+                dtype=w_scale_chunk_converted.storage.data.dtype,
+                device=w_scale_chunk_converted.storage.data.device)
+            w_scale_out = wrap_torch_tensor(w_scale_out_data)
+            w_scale_out.layout = w_scale_chunk_converted.layout
+
+        # Copy chunk results into output buffer
+        w_out.storage.data[start:end].copy_(w_chunk_converted.storage.data)
+        w_scale_out.storage.data[start:end].copy_(w_scale_chunk_converted.storage.data)
+
+        # Free chunk memory, clear cache periodically to reduce fragmentation
+        del w_chunk_converted, w_scale_chunk_converted
+        if start % (chunk_size * 4) == 0:
+            torch.cuda.empty_cache()
+
+    return w_out, w_scale_out
 
 
 def get_padded_size(size: int, padding: int) -> int:
