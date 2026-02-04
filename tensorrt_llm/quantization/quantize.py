@@ -9,16 +9,18 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import LayerQuantConfig, QuantConfig
 from ..parameter import Parameter
-from .layers import (FP4Linear, FP4RowLinear, FP8Linear, FP8RowLinear,
-                     Fp8RowwiseAttention, Fp8RowwiseGatedMLP, Fp8RowwiseMLP,
-                     Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
-                     Int8SmoothQuantRowLinear, QServeAttention, QServeGatedMLP,
-                     QServeMLP, QServeRmsNorm, SmoothQuantAttention,
-                     SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
-                     SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
-                     WeightOnlyGroupwiseQuantRowLinear,
-                     WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
-                     WeightOnlyQuantRowLinear)
+
+# isort: off
+from .layers import (
+    FP4Linear, FP4RowLinear, FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
+    Fp8RowwiseGatedMLP, Fp8RowwiseLayerNorm, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
+    Int8SmoothQuantLinear, Int8SmoothQuantRowLinear, QServeAttention,
+    QServeGatedMLP, QServeMLP, QServeRmsNorm, SmoothQuantAttention,
+    SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
+    SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
+    WeightOnlyGroupwiseQuantRowLinear, WeightOnlyQuantColumnLinear,
+    WeightOnlyQuantEmbedding, WeightOnlyQuantRowLinear)
+# isort: on
 from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
 
 
@@ -70,6 +72,14 @@ def quantize_layers(
                 else:
                     quant_mode = quant_config.quant_mode
                 init_params["quant_mode"] = quant_mode
+
+                # Auto-detect pre_quant_scale based on quant_algo
+                # For AWQ-based quantization methods that use pre_quant_scale
+                if quant_config.quant_algo in [
+                        QuantAlgo.W4A16_AWQ, QuantAlgo.NVFP4_AWQ,
+                        QuantAlgo.W4A8_AWQ
+                ]:
+                    init_params["pre_quant_scale"] = True
             if "bias" in init_params and not isinstance(module,
                                                         MixtureOfExperts):
                 init_params["bias"] = init_params["bias"] is not None
@@ -241,6 +251,7 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
 
     quant_cls_map = {
         RmsNorm: Fp8RowwiseRmsNorm,
+        LayerNorm: Fp8RowwiseLayerNorm,
         GatedMLP: Fp8RowwiseGatedMLP,
         MLP: Fp8RowwiseMLP,
         Attention: Fp8RowwiseAttention,

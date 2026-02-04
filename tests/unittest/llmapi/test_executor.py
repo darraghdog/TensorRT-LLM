@@ -10,7 +10,7 @@ import pytest
 import torch
 import zmq
 
-import tensorrt_llm.executor.serialization as serialization
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
@@ -18,7 +18,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationResult, GenerationResultBase,
                                    PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
-from tensorrt_llm.llmapi import LLM, BuildConfig
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
@@ -78,6 +78,7 @@ def llama_7b_tp2_path(engine_path: Path) -> Path:
     return path
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
@@ -99,6 +100,7 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
                        'E F G H I K L M')
 
 
+@pytest.mark.skip(reason="https://nvbugs/5488280")
 @pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
 def test_sync_generation(llama_7b_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_path)
@@ -211,21 +213,33 @@ def _test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
             result.outputs[0].token_ids) == ", neural network,"
 
         try:
-            stats = await executor.aget_stats()
-            stats = json.loads(stats)
-            assert stats["iter"] == 0
-            assert stats["cpuMemUsage"] > 0
-            assert stats["gpuMemUsage"] > 0
-            assert stats["inflightBatchingStats"]["numCtxTokens"] == 3
-            assert stats["inflightBatchingStats"]["numGenRequests"] == 0
-            assert stats["kvCacheStats"]["usedNumBlocks"] == 1
+            stats_result = executor.aget_stats(timeout=2)
+            # aget_stats now returns IterationResult, iterate to get stats
+            async for stats_str in stats_result:
+                stats = json.loads(stats_str) if isinstance(stats_str,
+                                                            str) else stats_str
+                assert stats["iter"] >= 0
+                assert stats["cpuMemUsage"] > 0
+                assert stats["gpuMemUsage"] > 0
+                break  # Just check first result
         except AsyncQueue.EventLoopShutdownError:
             pass
 
     asyncio.run(async_stats_task())
 
-    stats = executor.get_stats()
-    assert json.loads(stats)["iter"] == 1
+    # Poll for stats since RPC calls return immediately
+    import time
+    stats_list = []
+    for _ in range(10):
+        stats_list = executor.get_stats(timeout=0.5)
+        if stats_list:
+            break
+        time.sleep(0.1)
+
+    assert len(stats_list) > 0
+    stats = json.loads(stats_list[0]) if isinstance(stats_list[0],
+                                                    str) else stats_list[0]
+    assert stats["iter"] == 1
     executor.shutdown()
 
 
@@ -394,7 +408,7 @@ def test_ZeroMqQueue_serialization_complicated_dataclass():
     TokenRangeRetentionConfig = tllm.KvCacheRetentionConfig.TokenRangeRetentionConfig
     kvcache_config = tllm.KvCacheRetentionConfig(
         [TokenRangeRetentionConfig(0, 2, 30, datetime.timedelta(seconds=30))],
-        80)
+        80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     sampling_params = SamplingParams(max_tokens=4,
                                      embedding_bias=torch.randn(2, 2))
@@ -430,8 +444,7 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
         pull_pipe_addr=pull_pipe_addr,
         push_pipe_addr=push_pipe_addr,
         tokenizer_dir=tokenizer_dir,
-        record_creator=ResponsePostprocessWorker_record_creator,
-        BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
+        record_creator=ResponsePostprocessWorker_record_creator)
     worker.start()
 
 

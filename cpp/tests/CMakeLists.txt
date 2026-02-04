@@ -16,18 +16,15 @@
 # GoogleTest Preparation - Code block copied from
 # https://google.github.io/googletest/quickstart-cmake.html
 include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.15.2)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
+set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
   ${PROJECT_SOURCE_DIR}/include
-  ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${cutlass_source_dir}/include
+  ${cutlass_source_dir}/tools/util/include
   ${PROJECT_SOURCE_DIR}/tests/batch_manager
   ${PROJECT_SOURCE_DIR}/tests/utils)
 
@@ -69,32 +66,6 @@ function(add_gtest test_name test_src)
   add_dependencies(google-tests ${test_name})
 endfunction()
 
-add_subdirectory(unit_tests)
-
-add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
-
-add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
-add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
-add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
-
-add_gtest(moeLoadBalancerTest runtime/moeLoadBalancerTest.cpp)
-
-add_gtest(sanitizerTest runtime/sanitizerTest.cpp)
-
-add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)
-
-add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
-
-add_gtest(moeLoadBalanceKernelTest kernels/moeLoadBalanceKernelTest.cpp)
-
-add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
-
 add_subdirectory(utils)
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-  add_subdirectory(batch_manager)
-endif()
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-  add_subdirectory(executor)
-endif()
+add_subdirectory(unit_tests)
+add_subdirectory(e2e_tests)

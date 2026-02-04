@@ -1,19 +1,25 @@
-import asyncio
-from collections import defaultdict
-from functools import partial
+import json
+import uuid
+from functools import lru_cache, partial
+from pathlib import Path
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
 
-from openai.types.chat import ChatCompletionContentPartImageParam
+from openai.types.chat import (ChatCompletionContentPartImageParam,
+                               ChatCompletionContentPartInputAudioParam)
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import (ChatCompletionContentPartTextParam,
                                ChatCompletionMessageParam)
-from transformers import AutoConfig, ProcessorMixin
+from transformers import AutoConfig
 from typing_extensions import Required
 
-from tensorrt_llm.inputs import async_load_image, async_load_video
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.inputs import (ConversationMessage, MultimodalData,
+                                 MultimodalDataTracker,
+                                 add_multimodal_placeholders, async_load_audio,
+                                 async_load_image, async_load_video,
+                                 load_base64_image_embeds)
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.logger import logger
 
 
@@ -28,95 +34,62 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
-class ConversationMessage(TypedDict):
-    """Type definition for conversation message structure."""
-    role: str
-    content: str
+class ImageEmbedsData(TypedDict):
+    """Type definition for serialized image embeddings structure."""
+    data: Required[str]
+
+
+class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
+    """Type definition for image embeddings passed in base64-encoded PyTorch tensor format."""
+    image_embeds: Required[
+        # TODO: Besides "data", could support "url" and "ipc_handle" in the future.
+        ImageEmbedsData]
+    type: Required[Literal["image_embeds"]]
 
 
 # Type Aliases and Constants
 ChatCompletionContentPartParam: TypeAlias = Union[
-    OpenAIChatCompletionContentPartParam, ChatCompletionContentPartVideoParam,
-    str]
+    OpenAIChatCompletionContentPartParam,
+    ChatCompletionContentPartVideoParam,
+    ChatCompletionContentPartImageEmbedsParam,
+    str,
+]
 
-VALID_MESSAGE_CONTENT_MM_PART_TYPES = ["text", "image_url", "video_url"]
+# TODO: Add "input_audio" to support byte_encoded audio input.
+VALID_MESSAGE_CONTENT_MM_PART_TYPES = [
+    "text",
+    "image_url",
+    "video_url",
+    "audio_url",
+    "image_embeds",
+]
 
 # Parser Functions
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
 _ImageParser = partial(cast, ChatCompletionContentPartImageParam)
+_ImageEmbedsParser = partial(cast, ChatCompletionContentPartImageEmbedsParam)
 _VideoParser = partial(cast, ChatCompletionContentPartVideoParam)
+_AudioParser = partial(cast, ChatCompletionContentPartInputAudioParam)
 
 MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
-    str, dict[str, str]]]] = {
+    str, dict[str, str], None]]] = {
         "text":
         lambda part: _TextParser(part).get("text", None),
         "image_url":
         lambda part: _ImageParser(part).get("image_url", {}).get("url", None),
         "video_url":
         lambda part: _VideoParser(part).get("video_url", {}).get("url", None),
+        "audio_url":
+        lambda part: _AudioParser(part).get("audio_url", {}).get("url", None),
+        "image_embeds":
+        lambda part: _ImageEmbedsParser(part).get("image_embeds", {}).get(
+            "data", None),
     }
-
-
-class AsyncMultimodalDataTracker:
-    """Tracks and manages multimodal data for async processing."""
-
-    def __init__(self, model_config: AutoConfig):
-        self.model_config = model_config
-        self.mm_data = defaultdict[str](list)
-        self.mm_placeholder_counts = defaultdict[str](int)
-
-    async def retrieve_all_mm_data(self) -> Optional[Dict[str, List[Any]]]:
-        """Retrieve all collected multimodal data."""
-        if not self.mm_data:
-            return None
-
-        return {
-            modality: await asyncio.gather(*items)
-            for modality, items in self.mm_data.items()
-        }
-
-    def retrieve_multimodal_placeholder(self, modality: str,
-                                        current_count: int) -> Optional[str]:
-        """Get the appropriate placeholder for a given modality and model type."""
-        model_type = self.model_config.model_type
-
-        if modality == "image":
-            if model_type in ("qwen2_vl", "qwen2_5_vl"):
-                return "<|vision_start|><|image_pad|><|vision_end|>"
-            elif model_type in ("mllama", "llama4"):
-                return "<|image|>"
-            raise TypeError(f"Unknown {modality} model type: {model_type}")
-        elif modality == "video":
-            if model_type in ("qwen2_vl", "qwen2_5_vl"):
-                return "<|vision_start|><|video_pad|><|vision_end|>"
-            raise TypeError(f"Unknown {modality} model type: {model_type}")
-        raise TypeError(f"Unknown modality: {modality}")
-
-    def add_mm_data(self, media_type: str, data: Coroutine):
-        current_count = len(self.mm_data[media_type]) + 1
-        placeholder = self.retrieve_multimodal_placeholder(
-            media_type, current_count)
-        self.mm_data[media_type].append(data)
-        if placeholder:
-            self.mm_placeholder_counts[placeholder] += 1
-
-    def mm_data_counts(self) -> Dict[str, int]:
-        """Get the count of multimodal placeholders."""
-        return dict(self.mm_placeholder_counts)
-
-
-def add_multimodal_placeholders(text_prompt: str,
-                                mm_placeholder_counts: dict[str, int]) -> str:
-    """Add multimodal placeholders to the text prompt."""
-    placeholders = []
-    for placeholder in mm_placeholder_counts:
-        placeholders.extend([placeholder] * mm_placeholder_counts[placeholder])
-    return "\n".join(placeholders + [text_prompt])
 
 
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
-) -> tuple[str, Union[str, dict[str, str]]]:
+) -> tuple[str, Union[str, dict[str, str], None]]:
     """Parse a single multimodal part of a chat message."""
     assert isinstance(part, dict)
     part_type = part.get("type", None)
@@ -130,16 +103,16 @@ def _parse_chat_message_content_mm_part(
 
 
 def parse_chat_message_content_part(
-    part: ChatCompletionMessageParam,
-    mm_data_tracker: AsyncMultimodalDataTracker,
-) -> Optional[str]:
+    part: ChatCompletionContentPartParam,
+    mm_data_tracker: MultimodalDataTracker,
+) -> str | MultimodalData | None:
     """Parse a single part of a chat message."""
     if isinstance(part, str):
         return part
 
     part_type, content = _parse_chat_message_content_mm_part(part)
 
-    # if part_type is text/image_url/video_url but content is None, log a warning and skip
+    # if part_type is text/image_url/video_url/audio_url but content is None, log a warning and skip
     if part_type in VALID_MESSAGE_CONTENT_MM_PART_TYPES and content is None:
         logger.warning(
             "Skipping multimodal part '%s' (type: '%s') with empty / unparsable content.",
@@ -154,56 +127,95 @@ def parse_chat_message_content_part(
 
         async def load_image_async():
             try:
-                return await async_load_image(str_content)
+                image_kwargs = (
+                    mm_data_tracker._multimodal_server_config.media_io_kwargs
+                    or {}).get("image", {})
+                return await async_load_image(str_content, **image_kwargs)
             except Exception as e:
                 logger.error(f"Failed to load image: {str(e)}")
                 return None
 
-        mm_data_tracker.add_mm_data("image", load_image_async())
-        return None
+        return MultimodalData(modality="image",
+                              data=load_image_async(),
+                              is_embedding=False)
+
+    if part_type == "image_embeds":
+        str_content = cast(str, content)
+
+        async def decode_image_embeds_async():
+            try:
+                return load_base64_image_embeds(str_content)
+            except Exception as e:
+                logger.error(f"Failed to decode image data: {str(e)}")
+                return None
+
+        return MultimodalData(modality="image",
+                              data=decode_image_embeds_async(),
+                              is_embedding=True)
 
     if part_type == "video_url":
         str_content = cast(str, content)
 
         async def load_video_async():
             try:
-                return await async_load_video(str_content, num_frames=8)
+                video_kwargs = (
+                    mm_data_tracker._multimodal_server_config.media_io_kwargs
+                    or {}).get("video", {})
+                return await async_load_video(str_content, **video_kwargs)
             except Exception as e:
                 logger.error(f"Failed to load video: {str(e)}")
                 return None
 
-        mm_data_tracker.add_mm_data("video", load_video_async())
-        return None
+        return MultimodalData(modality="video",
+                              data=load_video_async(),
+                              is_embedding=False)
+
+    if part_type == "audio_url":
+        str_content = cast(str, content)
+
+        async def load_audio_async():
+            try:
+                audio_kwargs = (
+                    mm_data_tracker._multimodal_server_config.media_io_kwargs
+                    or {}).get("audio", {})
+                return await async_load_audio(str_content, **audio_kwargs)
+            except Exception as e:
+                logger.error(f"Failed to load audio: {str(e)}")
+                return None
+
+        return MultimodalData(modality="audio",
+                              data=load_audio_async(),
+                              is_embedding=False)
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
 
 
 def parse_chat_message_content_parts(
     role: str,
-    parts: Iterable[ChatCompletionMessageParam],
-    mm_data_tracker: AsyncMultimodalDataTracker,
-) -> List[ConversationMessage]:
+    parts: Iterable[ChatCompletionContentPartParam],
+    mm_data_tracker: MultimodalDataTracker,
+) -> ConversationMessage:
     """Parse multiple parts of a chat message."""
-    content_parts = []
+    text_parts = []
+    media_parts = []
     for part in parts:
         parse_res = parse_chat_message_content_part(part, mm_data_tracker)
         if parse_res:
-            content_parts.append(parse_res)
+            if isinstance(parse_res, str):
+                text_parts.append(parse_res)
+            else:
+                media_parts.append(parse_res)
 
-    text_prompt = "\n".join(content_parts)
-    mm_placeholder_counts = mm_data_tracker.mm_data_counts()
+    text_prompt = "\n".join(text_parts)
 
-    if mm_placeholder_counts:
-        text_prompt = add_multimodal_placeholders(text_prompt,
-                                                  mm_placeholder_counts)
-
-    return [ConversationMessage(role=role, content=text_prompt)]
+    return ConversationMessage(role=role,
+                               content=text_prompt,
+                               media=media_parts)
 
 
 def parse_chat_message_content(
-    message: ChatCompletionMessageParam,
-    mm_data_tracker: AsyncMultimodalDataTracker,
-) -> List[ConversationMessage]:
+        message: ChatCompletionMessageParam,
+        mm_data_tracker: MultimodalDataTracker) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -220,81 +232,111 @@ def parse_chat_message_content(
         content,
         mm_data_tracker,
     )
+    if role == "assistant":
+        result.update(_parse_assistant_message_content(message))
+    elif role == "tool":
+        result.update(_parse_tool_message_content(message))
+    return result
+
+
+# Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
+def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+    result = {}
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        result["tool_calls"] = []
+        for item in tool_calls:
+            if content := item["function"].get("arguments"):
+                if isinstance(content, str):
+                    item["function"]["arguments"] = json.loads(content)
+                else:
+                    item["function"]["arguments"] = content
+            else:
+                item["function"]["arguments"] = {}
+            result["tool_calls"].append(item)
+
+    return result
+
+
+def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+    result = {}
+    if "tool_call_id" in message:
+        result["tool_call_id"] = message["tool_call_id"]
     return result
 
 
 def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
-) -> Tuple[List[ConversationMessage], Optional[Coroutine[
-        Any, Any, Optional[Dict[str, List[Any]]]]]]:
+    multimodal_server_config: Optional[MultimodalServerConfig] = None
+) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
+        str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
+                                                                      int]]]:
     """Parse multiple chat messages and return conversation and coroutine."""
     conversation = []
-    mm_data_tracker = AsyncMultimodalDataTracker(model_config)
+    mm_placeholder_counts = []
+    mm_data_tracker = MultimodalDataTracker(model_config.model_type,
+                                            multimodal_server_config)
 
     for msg in messages:
-        sub_messages = parse_chat_message_content(msg, mm_data_tracker)
-        conversation.extend(sub_messages)
+        parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
+        conversation.append(parsed_msg)
+        if parsed_msg["media"]:
+            for mdata in parsed_msg["media"]:
+                mm_data_tracker.add_data(mdata["modality"],
+                                         mdata["data"],
+                                         is_embedding=mdata["is_embedding"])
+        mm_placeholder_count = mm_data_tracker.placeholder_counts()
+        if mm_placeholder_count:
+            parsed_msg["content"] = add_multimodal_placeholders(
+                model_config.model_type, parsed_msg["content"],
+                mm_placeholder_count)
+        mm_placeholder_counts.append(mm_placeholder_count)
 
-    return conversation, mm_data_tracker.retrieve_all_mm_data()
+    return conversation, mm_data_tracker.retrieve_all_async(
+    ), mm_placeholder_counts
 
 
-def resolve_hf_chat_template(
-    tokenizer: TokenizerBase,
-    processor: ProcessorMixin,
-    chat_template: Optional[str],
-    tools: Optional[list[dict[str, Any]]],
-) -> Optional[str]:
-    """Resolve the appropriate chat template to use."""
+def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
+    if id_type == "kimi_k2":
+        return f"functions.{func_name}:{idx}"
+    else:
+        # by default return random
+        return f"chatcmpl-tool-{uuid.uuid4().hex}"
 
-    # 1. If chat_template is not None, return it
-    if chat_template is not None:
+
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/44b5ce956d3cf28841615a58c1c0873af87bcfe2/vllm/entrypoints/chat_utils.py
+@lru_cache
+def load_chat_template(
+    chat_template: Path | str | None,
+    *,
+    is_literal: bool = False,
+) -> str | None:
+    if chat_template is None:
+        return None
+
+    if is_literal:
+        if isinstance(chat_template, Path):
+            raise TypeError(
+                "chat_template is expected to be read directly from its value")
+
         return chat_template
 
-    # 2. If tool is not provided, use the processor's default chat template
-    if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
-
-    # 3. If tool is provided, use the tool
     try:
-        return tokenizer.get_chat_template(chat_template, tools=tools)
-    except Exception:
-        logger.debug("Failed to load AutoTokenizer chat template for %s",
-                     tokenizer.name_or_path)
-    return None
+        with open(chat_template) as f:
+            return f.read()
+    except OSError as e:
+        if isinstance(chat_template, Path):
+            raise
 
+        JINJA_CHARS = "{}\n"
+        if not any(c in chat_template for c in JINJA_CHARS):
+            msg = (f"The supplied chat template ({chat_template}) "
+                   f"looks like a file path, but it failed to be "
+                   f"opened. Reason: {e}")
+            raise ValueError(msg) from e
 
-def apply_chat_template(
-    *,
-    tokenizer: TokenizerBase,
-    processor: ProcessorMixin,
-    conversation: list[ConversationMessage],
-    add_generation_prompt: bool,
-    tools: Optional[list[dict[str, Any]]] = None,
-    documents: Optional[list[dict[str, str]]] = None,
-    chat_template: Optional[str] = None,
-    chat_template_kwargs: Optional[dict[str, Any]] = None,
-) -> str:
-    """Apply chat template to the conversation."""
-    hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
-                                                chat_template, tools)
-
-    if hf_chat_template is None:
-        raise ValueError(
-            "No chat template found for the given tokenizer and tools.")
-
-    return tokenizer.apply_chat_template(
-        conversation=conversation,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-        tools=tools,
-        documents=documents,
-        chat_template=hf_chat_template,
-        **(chat_template_kwargs or {}),
-    )
-
-
-def check_multiple_response(n: int, backend: Optional[str]):
-    if n > 1 and backend == "pytorch":
-        raise ValueError(
-            "Multiple response is not supported in PyTorch workflow")
+        # If opening a file fails, set chat template to be args to
+        # ensure we decode so our escape are interpreted correctly
+        return load_chat_template(chat_template, is_literal=True)

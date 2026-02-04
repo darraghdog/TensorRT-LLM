@@ -1,46 +1,63 @@
 """Custom ops for MultiHead Latent attention."""
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
+from ....llmapi.llm_args import KvCacheConfig
 from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
-    BufferInitializerDict,
-    CacheConfig,
-    CacheInitializerDict,
     MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
+    ResourceHandlerDict,
+    UnpagedResourceHandler,
 )
 from .triton_attention import _flattened_context_mha, _generate_mha
 
 Constant = Union[int, float, str, None]
 
 
-@torch.library.custom_op("attention::fused_flattened_mla_with_cache", mutates_args=())
+def _precompute_inv_freq(
+    max_seq_len: int, head_dim: int, rope_theta: float, device: torch.device
+) -> torch.Tensor:
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    )
+    t = torch.arange(max_seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
+
+    freqs = torch.outer(t, inv_freq.to(t.device))
+    # Different from paper, but it uses a different permutation in order to obtain the same calculation
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos_sin_stacked = torch.stack([emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)])
+    return cos_sin_stacked
+
+
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_fused_flattened_mla_with_cache", mutates_args=()
+)
 def fused_flattened_mla_with_cache(
     # Q, K, V
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
     kv: torch.Tensor,
     k_pe: torch.Tensor,
-    # METADATA
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    # BUFFERS
-    cos_sin_stacked: torch.Tensor,
     # CONSTANTS
     softmax_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
 ) -> torch.Tensor:
     """Flattened & fused MLA with cache with triton kernels."""
     # b, s info
@@ -49,6 +66,15 @@ def fused_flattened_mla_with_cache(
     # 1. b > 0, s==1: this indicates a generate-only batch of tokens.
     # 2. b==1, s > 0: this indicates a mixed context+generate phase. The actual number of sequences
     #    and number of tokens per sequence are encoded in seq_len and seq_start.
+
+    # check for sequence info and truncate metadata
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+
+    seq_len = seq_len[:num_seq]
+    input_pos = input_pos[:num_seq]
+    cache_loc = cache_loc[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
 
     # Get parameters
     b, num_heads, s, qk_nope_head_dim = q_nope.shape
@@ -71,7 +97,12 @@ def fused_flattened_mla_with_cache(
     k_pe = k_pe.clone().transpose(1, 2).view(*bs_view, -1, qk_rope_head_dim).contiguous()
     value_states = value_states.transpose(1, 2).view(*bs_view, -1, v_head_dim).contiguous()
     # Apply RoPE
-    if cos_sin_stacked.numel() > 0:
+    if rope_theta is not None:
+        max_seq_len = (input_pos + seq_len).max().item()
+        cos_sin_stacked = _precompute_inv_freq(
+            max_seq_len, qk_rope_head_dim, rope_theta, q_pe.device
+        )
+
         # Extract cos and sin from freqs_cis
         cos_base = cos_sin_stacked[0, ...]
         sin_base = cos_sin_stacked[1, ...]
@@ -94,7 +125,7 @@ def fused_flattened_mla_with_cache(
             q_slice = q_pe[start : start + length]
             k_slice = k_pe[start : start + length]
 
-            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q_slice,
                 k_slice,
                 cos,
@@ -152,63 +183,27 @@ def fused_flattened_mla_with_cache_fake(
     q_pe: torch.Tensor,
     kv: torch.Tensor,
     k_pe: torch.Tensor,
-    # METADATA
+    # STANDARD METADATA
+    batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
-    seq_start: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    # EXTRA METADATA
+    #
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    # BUFFERS
-    cos_sin_stacked: torch.Tensor,
     # CONSTANTS
     softmax_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
 ):
     v_head_dim = kv.shape[-1] - q_nope.shape[-1]
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("attention::prepare_fused_mla_metadata", mutates_args=())
-def prepare_fused_mla_metadata(
-    input_ids: torch.Tensor,
-    position_ids: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    cache_loc: torch.Tensor,
-    pages_per_seq: torch.Tensor,
-    page_size: int,
-) -> List[torch.Tensor]:
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
-    seq_start = torch.zeros_like(seq_len[:num_seq])
-    seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
-    return (
-        seq_len[:num_seq].clone(),
-        input_pos[:num_seq].clone(),
-        cache_loc[:num_seq].clone(),
-        seq_start,
-    )
-
-
-@prepare_fused_mla_metadata.register_fake
-def prepare_fused_mla_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
-):
-    return (
-        torch.empty_like(seq_len),
-        torch.empty_like(input_pos),
-        torch.empty_like(cache_loc),
-        torch.empty_like(seq_len),
-    )
-
-
 @AttentionRegistry.register("MultiHeadLatentAttention")
 class MultiHeadLatentAttention(AttentionDescriptor):
-    @classmethod
-    def is_paged(cls) -> bool:
-        """Return if the attention op is paged or not."""
-        return False
-
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         """Get the attention layout expected by the backend."""
@@ -221,20 +216,20 @@ class MultiHeadLatentAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.deepseek.fused_mla
+        return torch.ops.auto_deploy.torch_attention_deepseek_fused_mla
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.fused_flattened_mla_with_cache
+        return torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache.default
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_fused_mla_metadata, 4
+    def get_standard_metadata_args(cls) -> List[str]:
+        return ["batch_info_host", "seq_len", "input_pos", "cache_loc", "cu_seqlen"]
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: CacheConfig
-    ) -> CacheInitializerDict:
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
+    ) -> ResourceHandlerDict:
         q_nope_fake = source_attn_node.args[0].meta["val"]
         q_pe_fake = source_attn_node.args[1].meta["val"]
         kv_fake = source_attn_node.args[2].meta["val"]
@@ -243,56 +238,21 @@ class MultiHeadLatentAttention(AttentionDescriptor):
         head_dim = q_nope_fake.shape[-1]
         rope_dim = q_pe_fake.shape[-1]
 
-        def _get_k_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for MultiHeadLatentAttention"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
+        return {
+            "k_cache": UnpagedResourceHandler(
                 num_kv_heads,
                 head_dim + rope_dim,
-                device=si.device,
-                dtype=cache_config.dtype or kv_fake.dtype,
-            )
-
-        def _get_v_cache(si: SequenceInfo):
-            assert not si.is_paged, "Paged cache not supported for MultiHeadLatentAttention"
-            return torch.empty(
-                si.num_pages,
-                si.page_size,
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_fake.dtype),
+            ),
+            "v_cache": UnpagedResourceHandler(
                 num_kv_heads,
                 head_dim,
-                device=si.device,
-                dtype=cache_config.dtype or kv_fake.dtype,
-            )
-
-        return {"k_cache": _get_k_cache, "v_cache": _get_v_cache}
-
-    @classmethod
-    def get_global_buffer_initializers(cls, source_attn_node: Node) -> BufferInitializerDict:
-        q_pe_fake = source_attn_node.args[1].meta["val"]
-        rope_head_dim = q_pe_fake.shape[-1]
-        rope_theta: float = 10000.0  # TODO: remove once MLA is unfused
-
-        def _get_cos_sin_stacked(si: SequenceInfo):
-            if rope_theta is None:
-                return torch.empty(0, device=si.device)
-            return cls._precompute_inv_freq(si.max_seq_len, rope_head_dim, rope_theta).to(si.device)
-
-        return {
-            f"cos_sin_stacked_{rope_head_dim}_{rope_theta}".replace(".", "_"): _get_cos_sin_stacked
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_fake.dtype),
+            ),
         }
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        return [None]
-
-    @staticmethod
-    def _precompute_inv_freq(seq_len: int, head_dim: int, rope_theta: float = 1e4) -> torch.Tensor:
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t = torch.arange(seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
-
-        freqs = torch.outer(t, inv_freq.to(t.device))
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos_sin_stacked = torch.stack([emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)])
-        return cos_sin_stacked
+        softmax_scale = None
+        rope_theta = 10000.0  # TODO: remove once MLA is unfused
+        return [softmax_scale, rope_theta]

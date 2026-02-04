@@ -1,6 +1,9 @@
 import asyncio
 import concurrent.futures
 import os
+import sys
+import threading
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
@@ -8,12 +11,12 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.bindings.executor import Response
-from tensorrt_llm.llmapi.utils import print_colored_debug
+from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
-from ..llmapi.utils import print_colored_debug
+from ..llmapi.utils import logger_debug
+from ..logger import logger
 
 
 class LlmLauncherEnvs(StrEnum):
@@ -49,14 +52,14 @@ def create_mpi_comm_session(
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
         ), f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR} is not set."
-        print_colored_debug(
+        logger_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
         hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
             addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
-        print_colored_debug(
+        logger_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
             "yellow")
         return MpiCommSession(n_workers=n_workers)
@@ -139,13 +142,31 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_queue_addr: tuple[str, Optional[bytes]]
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
-    stats_queue_addr: tuple[str, Optional[bytes]]
-    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
 
 
 def is_llm_response(instance):
-    from tensorrt_llm._torch.pyexecutor.llm_request import \
-        LlmResponse as PyLlmResponse
+    # Duck typing, expect one of:
+    #  tensorrt_llm.bindings.executor.Response
+    #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
+    # Avoid testing for "result", because an error bindings.executor.Response
+    # throws when accessing its result property.
+    return hasattr(instance, "has_error")
 
-    from .result import ResponseWrapper
-    return isinstance(instance, (Response, PyLlmResponse, ResponseWrapper))
+
+def print_alive_threads():
+    assert enable_llm_debug(
+    ), "print_alive_threads must be called with enable_llm_debug() enabled"
+
+    # Print all alive threads for debugging
+    alive_threads = [t for t in threading.enumerate() if t.is_alive()]
+    logger.info(
+        f'All alive threads after shutdown: {[t.name for t in alive_threads]}\n',
+        "red")
+    for t in alive_threads:
+        logger.info(f'Thread {t.name} (daemon={t.daemon}) is still alive')
+        # Get the stack trace for this thread
+        stack = sys._current_frames().get(t.ident)
+        if stack is not None:
+            logger.info(f'Stack trace for thread {t.name}:')
+            traceback.print_stack(stack, file=sys.stdout)
+            logger.info('')

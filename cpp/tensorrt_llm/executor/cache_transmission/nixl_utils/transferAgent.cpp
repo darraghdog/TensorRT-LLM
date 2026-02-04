@@ -22,14 +22,85 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <arpa/inet.h>
+#include <chrono>
+#include <dirent.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <nixl_types.h>
+#include <set>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+class FileLock
+{
+private:
+    int fd_;
+    std::string lockFile_;
+    bool locked_;
+
+public:
+    explicit FileLock(std::string const& lockFile)
+        : fd_(-1)
+        , lockFile_(lockFile)
+        , locked_(false)
+    {
+    }
+
+    ~FileLock()
+    {
+        unlock();
+    }
+
+    bool lock()
+    {
+        if (locked_)
+            return true;
+
+        size_t pos = lockFile_.find_last_of('/');
+        if (pos != std::string::npos)
+        {
+            std::string dir = lockFile_.substr(0, pos);
+            mkdir(dir.c_str(), 0755);
+        }
+
+        fd_ = open(lockFile_.c_str(), O_CREAT | O_WRONLY, 0644);
+        if (fd_ == -1)
+        {
+            TLLM_LOG_ERROR("Failed to open lock file: %s", lockFile_.c_str());
+            return false;
+        }
+
+        if (flock(fd_, LOCK_EX) == -1)
+        {
+            TLLM_LOG_ERROR("Failed to acquire file lock: %s", lockFile_.c_str());
+            close(fd_);
+            fd_ = -1;
+            return false;
+        }
+
+        locked_ = true;
+        return true;
+    }
+
+    void unlock()
+    {
+        if (locked_ && fd_ != -1)
+        {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+            fd_ = -1;
+            locked_ = false;
+        }
+    }
+};
 
 static std::string getAvailableIP()
 {
@@ -51,14 +122,14 @@ static std::string getAvailableIP()
         if (ifa->ifa_addr == nullptr)
             continue;
 
-        std::string ucxInterface = common::getEnvUCXInterface();
-        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+        std::string nixlInterface = common::getEnvNixlInterface();
+        if (!nixlInterface.empty() && strcmp(ifa->ifa_name, nixlInterface.c_str()) != 0)
         {
             continue;
         }
 
         // Skip the loopback interface
-        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        if (nixlInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
         {
             continue;
         }
@@ -71,8 +142,8 @@ static std::string getAvailableIP()
             char address_buffer[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
 
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
-                address_buffer);
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** NIXL    Interface: %s IP Address: %s",
+                ifa->ifa_name, address_buffer);
             ip = address_buffer;
             break;
         }
@@ -80,7 +151,7 @@ static std::string getAvailableIP()
     if (ifa == nullptr)
     {
         TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-            "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
+            "UCX   No valid IP address found please set correct NIXL interface with env variable TRTLLM_UCX_INTERFACE");
     }
 
     freeifaddrs(ifaddr);
@@ -155,6 +226,16 @@ uint16_t getIncrmentPort(uint16_t basePort)
     return list;
 }
 
+[[nodiscard]] nixl_reg_dlist_t NixlHelper::convertRegDlist(FileDescs const& descs)
+{
+    nixl_reg_dlist_t list(FILE_SEG);
+    for (auto const& desc : descs.getDescs())
+    {
+        list.addDesc(nixlBlobDesc{0, desc.getLen(), desc.getFd()});
+    }
+    return list;
+}
+
 [[nodiscard]] nixl_xfer_op_t NixlHelper::convert(TransferOp const& op)
 {
     switch (op)
@@ -175,6 +256,62 @@ uint16_t getIncrmentPort(uint16_t basePort)
     return list;
 }
 
+[[nodiscard]] nixl_xfer_dlist_t NixlHelper::convertXferDist(FileDescs const& descs)
+{
+    nixl_xfer_dlist_t list{FILE_SEG};
+    for (auto const& desc : descs.getDescs())
+    {
+        list.addDesc(nixlBasicDesc{0, desc.getLen(), desc.getFd()});
+    }
+    return list;
+}
+
+void NixlHelper::posixGpuToFileFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
+{
+    auto const& memVec = memoryDescs.getDescs();
+    auto const& fileVec = fileDescs.getDescs();
+    std::size_t i;
+
+    for (i = 0; i < std::min(memVec.size(), fileVec.size()); i++)
+    {
+        auto& memDesc = memVec[i];
+        auto& fileDesc = fileVec[i];
+
+        ssize_t numBytes = static_cast<ssize_t>(memDesc.getLen());
+        std::vector<uint8_t> hostBuffer(numBytes);
+
+        cudaError_t cpyErr = cudaMemcpy(
+            hostBuffer.data(), reinterpret_cast<void*>(memDesc.getAddr()), numBytes, cudaMemcpyDeviceToHost);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
+
+        ssize_t written = ::write(fileDesc.getFd(), hostBuffer.data(), numBytes);
+        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+    }
+}
+
+void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
+{
+    auto const& memVec = memoryDescs.getDescs();
+    auto const& fileVec = fileDescs.getDescs();
+    std::size_t i;
+
+    for (i = 0; i < std::min(memVec.size(), fileVec.size()); i++)
+    {
+        auto& memDesc = memVec[i];
+        auto& fileDesc = fileVec[i];
+
+        ssize_t numBytes = static_cast<ssize_t>(memDesc.getLen());
+        std::vector<uint8_t> hostBuffer(numBytes);
+
+        ssize_t bytesRead = ::read(fileDesc.getFd(), hostBuffer.data(), numBytes);
+        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error=%zd", bytesRead);
+
+        cudaError_t cpyErr = cudaMemcpy(
+            reinterpret_cast<void*>(memDesc.getAddr()), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
+        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+    }
+}
+
 NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
     : mRawAgent{agent}
     , mHandle{handle}
@@ -183,10 +320,40 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
     TLLM_CHECK(mHandle);
 }
 
-void NixlTransferStatus::wait() const
+TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
-    while (!isCompleted())
-        ;
+    auto startTime = std::chrono::steady_clock::now();
+
+    while (true)
+    {
+        auto status = mRawAgent->getXferStatus(mHandle);
+        if (status == NIXL_SUCCESS)
+        {
+            return TransferState::kSUCCESS;
+        }
+        else if (status != NIXL_IN_PROG)
+        {
+            return TransferState::kFAILURE;
+        }
+
+        // If timeout_ms < 0, wait indefinitely until status is not NIXL_IN_PROG
+        if (timeout_ms < 0)
+        {
+            std::this_thread::yield();
+            continue;
+        }
+
+        // Check if timeout has elapsed
+        auto elapsed
+            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
+                  .count();
+        if (elapsed >= timeout_ms)
+        {
+            return TransferState::kIN_PROGRESS;
+        }
+
+        std::this_thread::yield();
+    }
 }
 
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
@@ -198,21 +365,60 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
     nixl_status_t status;
-    auto envPort = common::getEnvNixlPort();
-    uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
-    nixlAgentConfig nixlConfig{config.useProgThread, true, port};
-    mAddress = getAvailableIP() + ":" + std::to_string(port);
-    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    if (config.useListenThread)
+    {
+        FileLock lock("/tmp/trtllm_nixl_port.lock");
+        if (!lock.lock())
+        {
+            TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
+        }
+        auto envPort = common::getEnvNixlPort();
+        uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
+        uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
+            ? std::stoi(config.backendParams.at("num_workers"))
+            : 1;
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
+            numWorker, 0, 10000, config.enableTelemetry};
+        mAddress = getAvailableIP() + ":" + std::to_string(port);
+        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    }
+    else
+    {
+        uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
+            ? std::stoi(config.backendParams.at("num_workers"))
+            : 1;
+        mAddress.clear();
+        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
+            numWorker, 0, 10000, config.enableTelemetry};
+        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    }
+
+    std::string nixlBackend = common::getEnvNixlBackend();
+    // List of supported backends - extend this list as new backends are added
+    static std::set<std::string> const kSUPPORTED_BACKENDS = {"UCX", "LIBFABRIC"};
+
+    if (kSUPPORTED_BACKENDS.find(nixlBackend) == kSUPPORTED_BACKENDS.end())
+    {
+        TLLM_LOG_WARNING("Unsupported NIXL backend: %s, fallback to UCX", nixlBackend.c_str());
+        nixlBackend = "UCX";
+    }
+
+    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent using NIXL backend: %s", nixlBackend.c_str());
 
     nixl_b_params_t init1;
+    for (auto const& [key, value] : config.backendParams)
+    {
+        init1[key] = value;
+        TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: %s: %s", key.c_str(), value.c_str());
+    }
     nixl_mem_list_t mems1;
-    status = mRawAgent->getPluginParams("UCX", mems1, init1);
+    status = mRawAgent->getPluginParams(nixlBackend.c_str(), mems1, init1);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
-    status = mRawAgent->createBackend("UCX", init1, mRawBackend);
+    status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)
     {
-        TLLM_THROW("Failed to create NIXL backend");
+        TLLM_THROW("Failed to create NIXL backend: %s", nixlBackend.c_str());
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
@@ -300,21 +506,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
 {
-    if (name == mName)
-    {
-        // FIXME: nixl does not support gen notif to itself ,but support local transfer. we use local transfer to notify
-        // itself
-        MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
-        TransferRequest request{TransferOp::kWRITE, descs, descs, name, syncMessage};
-        auto request_status = submitTransferRequests(request);
-        request_status->wait();
-    }
-    else
-    {
-        auto status = mRawAgent->genNotif(name, syncMessage);
-        TLLM_CHECK_WITH_INFO(
-            status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-    }
+
+    auto status = mRawAgent->genNotif(name, syncMessage);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()
@@ -328,16 +523,19 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
     return notifs;
 }
 
-ConnectionInfoType NixlTransferAgent::getConnectionInfo()
+ConnectionInfoType NixlTransferAgent::getLocalConnectionInfo()
 {
     return mAddress;
 }
 
-void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
+void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
     std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
     std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
-    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "connectRemoteAgent get empty ip or port, connectionInfo: %s",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
+        name.c_str());
+    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
     md_extra_params.ipAddr = ip;
@@ -362,7 +560,7 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
         }
     }
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s success status: %s",
+        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s success status: %s",
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
 
@@ -379,6 +577,133 @@ NixlTransferAgent::~NixlTransferAgent()
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
 }
 
+NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
+    : mName{config.mName}
+{
+    nixlAgentConfig nixlConfig{config.useProgThread};
+    nixlBackendH* backend;
+    nixl_status_t status;
+    nixl_b_params_t init;
+
+    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    init["batch_pool_size"] = std::to_string(8);
+    init["batch_limit"] = std::to_string(128);
+    init["max_request_size"] = std::to_string(16 * 1024 * 1024);
+
+    if (config.multiThread)
+    {
+        status = mRawAgent->createBackend("GDS_MT", init, backend);
+        if (status != NIXL_SUCCESS || !backend)
+            TLLM_THROW("Failed to create NIXL GDS_MT backend, status = %d", status);
+    }
+    else
+    {
+        status = mRawAgent->createBackend("GDS", init, backend);
+        if (status != NIXL_SUCCESS || !backend)
+            TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
+    }
+}
+
+int NixlLoopbackAgent::registerMemory(MemoryDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+int NixlLoopbackAgent::deregisterMemory(MemoryDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+int NixlLoopbackAgent::registerFiles(FileDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->registerMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+int NixlLoopbackAgent::deregisterFiles(FileDescs const& descs)
+{
+    nixl_status_t status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(descs));
+    if (status != NIXL_SUCCESS)
+        return -1;
+
+    return 0;
+}
+
+std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitLoopbackRequests(
+    MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload)
+{
+    nixl_xfer_dlist_t vram_seg = NixlHelper::convertXferDist(memoryDescs);
+    nixl_xfer_dlist_t file_seg = NixlHelper::convertXferDist(fileDescs);
+    nixl_xfer_dlist_t& src = isOffload ? vram_seg : file_seg;
+    nixl_xfer_dlist_t& dst = isOffload ? file_seg : vram_seg;
+    nixl_xfer_op_t op = isOffload ? NIXL_WRITE : NIXL_READ;
+    nixlXferReqH* handle = nullptr;
+
+    nixl_status_t status = mRawAgent->createXferReq(op, src, dst, mName, handle);
+    TLLM_CHECK(status == NIXL_SUCCESS && handle);
+    status = mRawAgent->postXferReq(handle);
+    TLLM_CHECK(status == NIXL_IN_PROG);
+
+    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+}
+
+void NixlLoopbackAgent::executeLoopbackRequest(
+    MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload)
+{
+    bool fallback = false;
+    int ret;
+
+    ret = this->registerFiles(fileDescs);
+    if (ret < 0)
+    { // register can fail if no GDS support
+        TLLM_LOG_DEBUG("NIXL GDS register files failed, using POSIX fallback");
+        fallback = true;
+    }
+    else
+    {
+        ret = this->registerMemory(memoryDescs);
+        if (ret < 0)
+        { // register can fail if no GDS support
+            TLLM_LOG_DEBUG("NIXL GDS register memory failed, using POSIX fallback");
+            this->deregisterFiles(fileDescs);
+            fallback = true;
+        }
+    }
+
+    if (fallback)
+    {
+        if (isOffload)
+        {
+            NixlHelper::posixGpuToFileFallback(memoryDescs, fileDescs);
+        }
+        else
+        {
+            NixlHelper::posixFileToGpuFallback(memoryDescs, fileDescs);
+        }
+
+        return;
+    }
+
+    std::unique_ptr<TransferStatus> status = this->submitLoopbackRequests(memoryDescs, fileDescs, isOffload);
+    TLLM_CHECK_WITH_INFO(status != nullptr, "submitLoopbackRequests failed");
+    TransferState transferState = status->wait();
+    TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "submitLoopbackRequests failed");
+
+    this->deregisterMemory(memoryDescs);
+    this->deregisterFiles(fileDescs);
+}
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
@@ -390,6 +715,15 @@ extern "C"
     {
         TLLM_CHECK(config);
         return std::make_unique<NixlTransferAgent>(*config);
+    }
+}
+
+extern "C"
+{
+    std::shared_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config)
+    {
+        TLLM_CHECK(config);
+        return std::make_shared<NixlLoopbackAgent>(*config);
     }
 }
 

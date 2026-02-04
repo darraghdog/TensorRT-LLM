@@ -18,8 +18,14 @@ import os
 import pytest
 from defs.common import (convert_weights, get_dummy_spec_decoding_heads,
                          venv_check_call)
-from defs.conftest import skip_post_blackwell, skip_pre_ada
+from defs.conftest import get_sm_version, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @skip_post_blackwell
@@ -154,6 +160,15 @@ def test_with_dummy_eagle(hf_model_root,
                           data_type="bfloat16"):
     print("Build engines...")
     model_name = "eagle"
+
+    # We unset WORLD_SIZE while running tests in specific cluster nodes to
+    # deal with a bug in transformers library. Trainer initialization in
+    # get_dummy_spec_decoding_heads() function fails if WORLD_SIZE is unset.
+    # Preemptively skip tests if WORLD_SIZE is unset.
+    if os.environ.get("WORLD_SIZE") is None:
+        pytest.skip(
+            "[test_with_dummy_eagle] Skipping test due to missing WORLD_SIZE env variable."
+        )
 
     print("Creating dummy Eagle heads...")
     get_dummy_spec_decoding_heads(hf_model_dir=hf_model_root,
@@ -305,6 +320,7 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
 
 @skip_post_blackwell
 @skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],

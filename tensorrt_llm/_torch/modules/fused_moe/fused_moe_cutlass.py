@@ -1,21 +1,33 @@
+import inspect
 import os
-from typing import Dict, List, Optional, Union
+from functools import cached_property
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import logger
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from ...distributed import allgather, reducescatter
+from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
-from ...model_config import ModelConfig, MoeLoadBalancerConfig
-from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                      reswizzle_sf, swizzle_sf, unswizzle_sf)
-from .interface import MoE
-from .moe_load_balancer import MoeLoadBalancer
-from .quantization import (FP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-                           MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
-                           UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
+from ...model_config import ModelConfig
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor)
+from .interface import AlltoallMethodType, MoE
+from .quantization import UnquantizedFusedMoEMethod
+
+# isort: off
+from .quantization import (
+    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
+    INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
+# isort: on
 from .routing import BaseMoeRoutingMethod
 
 
@@ -28,20 +40,12 @@ class CutlassFusedMoE(MoE):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
 
     MoE torch custom op:
-        In min-latency mode:
-        Quant:
-            fp8 block scales (SM90 Hopper only):
-                FusedMoE Op: dynamic quant + gemm1 + swiglu + gemm2 (return tensor list).
-            fp8 qdq, nvfp4:
-                FusedMoE Op: gemm1 + swiglu + gemm2 (return tensor list).
-
         In max-throughput mode:
         Quant:
             fp8 block scales (SM90 Hopper only):
@@ -50,22 +54,155 @@ class CutlassFusedMoE(MoE):
                 FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
 
     FusedMoE module:
-        min-latency mode:
-            routing(topK, etc.) + FusedMoE Op
-            equals to: routing(topK, etc.) [+ dynamic quant fp8 qdq | optional dynamic quant nvfp4] + gemm1 + swiglu + gemm2
-
         max-throughput mode:
             routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ fp4_allgather] + FusedMoe Op[no allreduce] + reducescatter, with AttentionDP on
             equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
-
-    In min-latency mode, setting `reduce_results=False` disables the AllReduce in the FusedMoE module, so any necessary AllReduce operations must be added explicitly in the model definition.
-    AttentionDP should be turned off for min-latency mode.
-
-    Large-scale EP:
-    When we have redundant expert, we have more weight slots than `num_experts`, in that case, we separate the concepts of expert and slot.
-    Expert is the concept from model's perspective while slot is the concept from model engine's perspective.
-    There should be at least `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
     """
+
+    # Quantization algorithm support table for can_implement()
+    # Format: quant_algo -> {sm_constraint, dtypes}
+    # sm_constraint types:
+    #   - ("min", N): SM >= N
+    #   - ("exact", N): SM == N
+    #   - ("in", {N1, N2, ...}): SM in set
+    _QUANT_SUPPORT_TABLE = {
+        # Unquantized (FP16/BF16): SM >= 80
+        None: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # FP8 per-tensor (QDQ): SM >= 89
+        QuantAlgo.FP8: {
+            "sm_constraint": ("min", 89),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+        },
+        # FP8_BLOCK_SCALES: SM == 90 only
+        QuantAlgo.FP8_BLOCK_SCALES: {
+            "sm_constraint": ("exact", 90),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+        },
+        # NVFP4: SM in {100, 103}
+        QuantAlgo.NVFP4: {
+            "sm_constraint": ("in", {100, 103}),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+        },
+        # W4A8_AWQ: SM in {89, 90} only
+        QuantAlgo.W4A8_AWQ: {
+            "sm_constraint": ("in", {89, 90}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W8A16: SM >= 80
+        QuantAlgo.W8A16: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W4A16_MXFP4: SM == 90 only
+        QuantAlgo.W4A16_MXFP4: {
+            "sm_constraint": ("exact", 90),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # W4A8_MXFP4_FP8: SM in {100, 103}
+        QuantAlgo.W4A8_MXFP4_FP8: {
+            "sm_constraint": ("in", {100, 103}),
+            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+        },
+        # W4A8_MXFP4_MXFP8: SM in {100, 103}
+        QuantAlgo.W4A8_MXFP4_MXFP8: {
+            "sm_constraint": ("in", {100, 103}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+    }
+
+    # Quantization algorithms that support gptoss_style
+    _GPTOSS_SUPPORTED_ALGOS = {QuantAlgo.W4A8_MXFP4_MXFP8}
+
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if CutlassFusedMoE can implement the given quantization algorithm.
+
+        CutlassFusedMoE supports:
+        - Unquantized (FP16/BF16): SM >= 80
+        - FP8 per-tensor (QDQ): SM >= 89
+        - FP8_BLOCK_SCALES: SM == 90 only
+        - NVFP4: SM in {100, 103}
+        - W4A8_AWQ: SM in {89, 90} only
+        - W8A16: SM >= 80
+        - W4A16_MXFP4: SM == 90 only
+        - W4A8_MXFP4_FP8: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103}
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type (before quantization).
+                Supported dtypes vary by quantization mode:
+                - Unquantized: float16, bfloat16
+                - FP8/FP8_BLOCK_SCALES/W4A8_MXFP4_FP8: float16, bfloat16, float32
+                - NVFP4: float16, bfloat16, float8_e4m3fn
+                - W4A16_MXFP4/W4A8_AWQ/W8A16/W4A8_MXFP4_MXFP8: float16, bfloat16
+            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CutlassFusedMoE only supports gptoss_style for W4A8_MXFP4_MXFP8 quantization.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # Check minimum SM version for Cutlass backend
+        if sm_version < 80:
+            return _warn_and_return(
+                f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
+
+        # Check gptoss_style support
+        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            return _warn_and_return(
+                f"CutlassFusedMoE gptoss_style only supports W4A8_MXFP4_MXFP8 "
+                f"(got quant_algo={quant_algo})")
+
+        # Check if quant_algo is supported
+        if quant_algo not in cls._QUANT_SUPPORT_TABLE:
+            return _warn_and_return(
+                f"CutlassFusedMoE does not support quant_algo={quant_algo}")
+
+        support_info = cls._QUANT_SUPPORT_TABLE[quant_algo]
+
+        # Check SM version constraint
+        constraint_type, constraint_value = support_info["sm_constraint"]
+        algo_name = "unquantized" if quant_algo is None else quant_algo.name
+
+        if constraint_type == "min":
+            if sm_version < constraint_value:
+                return _warn_and_return(
+                    f"CutlassFusedMoE {algo_name} requires SM >= {constraint_value}, "
+                    f"got SM{sm_version}")
+        elif constraint_type == "exact":
+            if sm_version != constraint_value:
+                return _warn_and_return(
+                    f"CutlassFusedMoE {algo_name} only supports SM{constraint_value}, "
+                    f"got SM{sm_version}")
+        elif constraint_type == "in":
+            if sm_version not in constraint_value:
+                sm_list = "/".join(f"SM{v}" for v in sorted(constraint_value))
+                return _warn_and_return(
+                    f"CutlassFusedMoE {algo_name} only supports {sm_list}, "
+                    f"got SM{sm_version}")
+
+        # Check dtype_activation
+        supported_dtypes = support_info["dtypes"]
+        if dtype_activation not in supported_dtypes:
+            dtype_list = ", ".join(str(d) for d in supported_dtypes)
+            return _warn_and_return(
+                f"CutlassFusedMoE {algo_name} requires {dtype_list}, "
+                f"got {dtype_activation}")
+
+        return True, None
 
     def __init__(
         self,
@@ -77,13 +214,19 @@ class CutlassFusedMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        bias: bool = False,
         apply_router_weight_on_input: bool = False,
-        enable_alltoall: bool = False,
-        moe_load_balancer: Optional[MoeLoadBalancer] = None,
         layer_idx: Optional[int] = None,
+        swiglu_alpha: Optional[torch.Tensor] = None,
+        swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
+        init_load_balancer: bool = True,
+        without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
         super().__init__(
@@ -95,59 +238,38 @@ class CutlassFusedMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
-        self.layer_idx = layer_idx
-        moe_load_balancer_config = model_config.moe_load_balancer
-        if moe_load_balancer_config is None:
-            assert moe_load_balancer is None
-            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments
-            moe_load_balancer_config = MoeLoadBalancerConfig()
-            moe_load_balancer_config.setup(num_experts=num_experts,
-                                           ep_rank=self.ep_rank,
-                                           ep_size=self.ep_size)
-        else:
-            assert moe_load_balancer is not None
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
 
-        self.num_slots = moe_load_balancer_config.num_slots
-        if self.smart_router:
-            assert self.num_slots == self.num_experts, "Smart router should not have redundant slots"
+        if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
+        ):
+            self.hidden_size = ((self.hidden_size + 127) // 128) * 128
+            self.intermediate_size_per_partition = (
+                (self.intermediate_size_per_partition + 127) // 128) * 128
 
-        self.initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
-            layer_idx)
-        self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
-        self.slot_start = moe_load_balancer_config.slot_start
-        self.slot_end = moe_load_balancer_config.slot_end
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
+        # Note: num_slots, expert_size_per_partition, initial_global_assignments,
+        # slot_start, slot_end, initial_local_expert_ids are all initialized by
+        # base class's _init_load_balancer() method
 
-        self.balancer_layer = None
-        if moe_load_balancer is not None:
-            self.balancer_layer = moe_load_balancer.add_layer(
-                expert_count=num_experts,
-                top_k=routing_method.experts_per_token,
-                slot_count_per_rank=self.expert_size_per_partition,
-            )
-            self.balancer_layer.set_initial_weight_assignments(
-                self.initial_global_assignments)
-            logger.info(
-                f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
-            )
-            logger.info(
-                f"initial_global_assignments (layer {layer_idx}) = {self.initial_global_assignments}"
-            )
-
-        max_num_tokens = model_config.max_num_tokens
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-            )
+        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        if self.moe_max_num_tokens < default_moe_max_num_tokens:
+            self.aux_stream = aux_stream_dict[
+                AuxStreamType.
+                MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
+                )
             self.event_dict = {
                 key: torch.cuda.Event()
                 for key in [EventType.Main, EventType.MoeChunkingOverlap]
@@ -166,20 +288,71 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
-        self.enable_alltoall = enable_alltoall
-        self.use_postquant_alltoall = False
-        if self.enable_alltoall:
-            assert self.use_dp and self.parallel_size > 1,\
-                "alltoall should only enabled with attention dp and parallel_size > 1"
-            qm = self.quant_config.quant_mode
-            self.use_postquant_alltoall = (os.environ.get(
-                "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
-                                           == "1") and qm.has_nvfp4()
-        self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-            model_config.mapping) if enable_alltoall else None
+        # When without_comm=True, skip communication initialization (ConfigurableMoE will handle it)
+        if not without_comm:
+            self.alltoall_method_type = self.select_alltoall_method_type()
+            logger.info_once(
+                f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
+                key="alltoall_method_type")
+            self.alltoall_workspace = None
+            self.alltoall_prepare_workspace = None
+            self.use_low_precision_combine = False
+            if self.enable_alltoall:
+                self.use_low_precision_combine = model_config.use_low_precision_moe_combine
+
+                if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
+                    MnnvlMemory.initialize()
+                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
+                        model_config.mapping)
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                        model_config.mapping)
+                elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                    # Calculate required workspace size
+                    ep_size = self.mapping.moe_ep_size
+                    max_num_tokens = model_config.max_num_tokens
+                    hidden_size = self.hidden_size
+                    dtype = self.dtype or torch.float16
+
+                    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+                        ep_size,
+                        self.routing_method.experts_per_token,
+                        max_num_tokens,
+                        hidden_size,
+                        dtype,
+                        self.num_experts if self.layer_load_balancer else None,
+                    )
+
+                    self.moe_a2a = MoeAlltoAll(
+                        mapping=self.mapping,
+                        max_num_tokens=model_config.max_num_tokens,
+                        top_k=self.routing_method.experts_per_token,
+                        num_slots=self.num_slots,
+                        workspace_size_per_rank=workspace_size,
+                        num_experts=self.num_experts
+                        if self.layer_load_balancer else None,
+                    )
+                elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
+                    raise NotImplementedError(
+                        "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported alltoall method type: {self.alltoall_method_type!r}"
+                    )
+        else:
+            # When without_comm=True, set minimal attributes
+            # Communication will be handled by parent wrapper (e.g., ConfigurableMoE)
+            self.alltoall_method_type = AlltoallMethodType.NotEnabled
+            self.alltoall_workspace = None
+            self.alltoall_prepare_workspace = None
+            self.use_low_precision_combine = False
+            self.moe_a2a = None
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        # Finalize fusion should be disabled if Lora is used.
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -188,19 +361,18 @@ class CutlassFusedMoE(MoE):
     def _check_configs(self):
         assert self._weights_created
 
-        if self.enable_alltoall:
-            assert self.use_dp and self.parallel_size > 1,\
-                "alltoall should only enabled with attention dp and parallel_size > 1"
-
         if self.apply_router_weight_on_input:
             assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if not (self.quant_config.quant_mode.has_nvfp4()
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
-                    | self.quant_config.quant_mode.
-                    is_int4_weight_only_per_group()):
+                    | self.quant_config.quant_mode.is_weight_only()
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                    | self.quant_config.quant_mode.has_w4a16_mxfp4()
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -211,18 +383,151 @@ class CutlassFusedMoE(MoE):
         return self.quant_config and self.quant_config.quant_mode.is_int4_weight_only_per_group(
         )
 
+    @property
+    def has_int8_woq_per_channel(self):
+        return self.quant_config and self.quant_config.layer_quant_mode.is_int8_weight_only(
+        ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
+
+    def select_alltoall_method_type(self) -> AlltoallMethodType:
+        # If no attention DP, no need to use AlltoAll.
+        if self.mapping.dp_size == 1:
+            return AlltoallMethodType.NotEnabled
+
+        # AlltoAll cannot support MoE TP.
+        if self.mapping.moe_tp_size != 1:
+            return AlltoallMethodType.NotEnabled
+
+        if not MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.NotEnabled
+
+        all2all_method_type = os.environ.get("TRTLLM_FORCE_ALLTOALL_METHOD")
+        if all2all_method_type is not None:
+            if AlltoallMethodType[all2all_method_type] in [
+                    AlltoallMethodType.DeepEP,
+                    AlltoallMethodType.DeepEPLowLatency
+            ]:
+                raise NotImplementedError(
+                    "DeepEP and DeepEPLowLatency are not supported for CutlassFusedMoE yet"
+                )
+            return AlltoallMethodType[all2all_method_type]
+
+        # TODO: We found that NVLinkOneSided performs better than NCCL AllGather/ReduceScatter,
+        # regardless of the relationship between EP size and topK. We favor NVLinkOneSided for now.
+        # if not self.mapping.moe_ep_size > self.routing_method.experts_per_token:
+        #     return AlltoallMethodType.NotEnabled
+        return AlltoallMethodType.NVLinkOneSided
+
+    @cached_property
+    def enable_alltoall(self):
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
+
+    def quantize_input(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        post_quant_comm: bool = True,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Quantize input tensor - CutlassFusedMoE implementation
+
+        Handles all quantization cases for Cutlass backend.
+
+        Args:
+            x: Input tensor to quantize
+            post_quant_comm: Whether this is for post-quantization communication
+                           (allgather or alltoall). If True, x_sf will be reshaped to 2D.
+
+        Returns:
+            Tuple of (quantized_x, x_sf)
+        """
+        x_sf = None
+        if self.has_any_quant:
+            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
+                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, self.fc31_input_dequant)
+            elif self.has_deepseek_fp8_block_scales:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_w4afp8:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_w4a16_mxfp4:
+                pad_size = self.hidden_size - x.shape[1]
+                x = torch.nn.functional.pad(x, (0, pad_size))
+            elif self.has_int8_woq_per_channel:
+                # No quantization needed here, handled in kernel
+                pass
+            elif self.has_nvfp4:
+                if hasattr(
+                        self,
+                        'fc31_act_scale') and self.fc31_act_scale is not None:
+                    assert not isinstance(
+                        x, Fp4QuantizedTensor
+                    ), "Fp4QuantizedTensor is not expected for AWQ quantization."
+                    x = x * self.fc31_act_scale
+                # Quantize based on communication scenario
+                if post_quant_comm:
+                    if isinstance(x, Fp4QuantizedTensor):
+                        assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                        x_row = x.shape[0]
+                    else:
+                        x_row = x.shape[0]
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, False)
+                    # Reshape x_sf to 2D for post-quant communication
+                    if x_sf is not None:
+                        x_sf = x_sf.view((x_row, -1))
+                else:
+                    if not isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, True)
+            elif self.has_w4a8_mxfp4_mxfp8:
+                if post_quant_comm:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, False, alignment=self.quant_method.weight_alignment)
+                    # Reshape x_sf to 2D for post-quant communication
+                    # x.shape[0] is padded
+                    if x_sf is not None:
+                        x_sf = x_sf.view((x.shape[0], -1))
+                else:
+                    x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                        x, True, alignment=self.quant_method.weight_alignment)
+            else:
+                raise ValueError(
+                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+
+        return x, x_sf
+
+    def _supports_load_balancer(self) -> bool:
+        """CutlassFusedMoE supports load balancer."""
+        return True
+
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return FP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
                 return WInt4AFP8FusedMoEMethod()
+            elif self.has_int8_woq_per_channel:
+                return INT8WoqPerChannelFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+                return W4A8MXFP4FP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
+                return WFP4A16FusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+                return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -240,402 +545,516 @@ class CutlassFusedMoE(MoE):
         self._weights_created = True
         self._check_configs()
 
-    def reducescatter_or_allreduce(
+    def supports_moe_output_in_alltoall_workspace(self):
+        return True
+
+    def run_moe(
         self,
-        inputs,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-    ):
-        outputs = inputs
-        if self.parallel_size > 1 and not self.enable_alltoall:
-            if self.use_dp:
-                outputs = reducescatter(
-                    inputs,
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
-            elif self.reduce_results:
-                outputs = self.all_reduce(inputs)
-        return outputs
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: Optional[torch.Tensor] = None,
+        is_sf_swizzled: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        tuner_num_tokens: Optional[int] = None,
+        tuner_top_k: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """
+        Run MoE computation with Cutlass backend.
+
+        This method encapsulates the core MoE computation logic, handling different
+        quantization schemes.
+
+        Args:
+            x: Input hidden states (may be pre-quantized)
+            token_selected_experts: Expert IDs or expert slots [num_tokens, top_k]
+                                   If EPLB is enabled, represents expert slots; otherwise expert IDs
+            token_final_scales: Final scaling factors for each token
+            x_sf: Input scale factors (optional, for certain quantization schemes)
+            is_sf_swizzled: Whether scaling factors are swizzled
+            output_dtype: Output data type (optional)
+            tuner_num_tokens: Number of tokens for profiling tuner (optional)
+            tuner_top_k: Top-k value for profiling tuner (optional)
+            moe_output: Pre-allocated output buffer (optional)
+            enable_alltoall: Whether alltoall communication is enabled (optional). If None, defaults to self.enable_alltoall.
+
+        Returns:
+            final_hidden_states: Output tensor from MoE computation
+        """
+        # Determine weight dtype based on quantization mode
+        weight_dtype = self.w3_w1_weight.dtype
+        if self.has_any_quant:
+            if self.has_w4afp8:
+                weight_dtype = torch.quint4x2
+            elif self.has_w4a16_mxfp4:
+                weight_dtype = torch.uint8
+
+        if enable_alltoall is None:
+            enable_alltoall = self.enable_alltoall
+
+        result = torch.ops.trtllm.fused_moe(
+            x,
+            token_selected_experts,
+            token_final_scales,
+            self.w3_w1_weight.view(weight_dtype),
+            self.w3_w1_bias,
+            self.w2_weight.view(weight_dtype),
+            self.w2_bias,
+            output_dtype,
+            quant_scales=self.quant_scales,
+            input_sf=x_sf,
+            swizzled_input_sf=is_sf_swizzled,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            cluster_size=self.cluster_size,
+            cluster_rank=self.cluster_rank,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
+            use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
+            use_int8_woq_per_channel=self.has_int8_woq_per_channel,
+            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8,
+            min_latency_mode=False,
+            use_fused_finalize=self.use_fused_finalize,
+            tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
+            activation_type=self.activation_type,
+            unpadded_hidden_size=self.unpadded_hidden_size,
+            out_tensor=moe_output,
+        )
+        # When moe_output is provided, the result is written in-place and
+        # fused_moe returns empty list to avoid aliasing constraint violation.
+        # Otherwise, unpack the single tensor from the returned list.
+        if moe_output is not None:
+            final_hidden_states = moe_output
+        else:
+            final_hidden_states = result[0]
+
+        return final_hidden_states
 
     def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: tuple = (True, True),
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
-            output_dtype = output_dtype
         else:
             output_dtype = x.dtype
 
-        use_fp8_block_scaling = False
-        use_w4a8_group_scaling = False
-        weight_dtype = self.w3_w1_weight.dtype
+        is_first_call, is_last_call = repeating_info
 
+        self._load_balancer_start_wait_gpu_stage(is_first_call)
+
+        # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
-        if self.balancer_layer is None:
-            token_selected_slots = token_selected_experts
+        assert token_selected_experts.shape[
+            1] == self.routing_method.experts_per_token
+        assert token_selected_experts.shape == token_final_scales.shape
+        assert token_selected_experts.shape[0] == router_logits.shape[0]
+        assert token_final_scales.dtype == torch.float32
+        assert token_selected_experts.dtype == torch.int32
+
+        if self.layer_load_balancer:
+            self._load_balancer_done_wait_gpu_stage(is_first_call)
+            ignore_allreduce = self.enable_alltoall and self.alltoall_method_type in (
+                AlltoallMethodType.NVLinkTwoSided,
+                AlltoallMethodType.NVLinkOneSided,
+            )
+            self._load_balancer_update_statistic(
+                token_selected_experts,
+                is_first_call,
+                is_last_call,
+                ignore_allreduce=ignore_allreduce)
+            token_selected_slots = self._load_balancer_route(
+                token_selected_experts, self.use_dp)
         else:
-            # If attention DP is enabled, token_selected_experts is a local rank tensor,
-            # so we need to offset the round robin position by ep_rank
-            token_selected_slots = self.balancer_layer.route(
-                token_selected_experts, offset_by_ep_rank=self.use_dp)
+            token_selected_slots = token_selected_experts
 
         # If load balancer is disabled, the statistics are collected from expert IDs.
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
-
-        assert token_selected_slots.shape[
-            1] == self.routing_method.experts_per_token
-        assert token_selected_slots.shape == token_final_scales.shape
-        assert token_selected_slots.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_slots.dtype == torch.int32
+        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
+            self.num_slots, token_selected_slots)
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
-        token_count = x.shape[0]
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
 
-        alltoall_info = None
+        # Quantize inputs using extracted method
+        # For post_quant_comm scenarios, x_sf will be reshaped to 2D inside quantize_input
+        post_quant_comm = run_post_quant_allgather or self.enable_alltoall
+        x, x_sf = self.quantize_input(x, post_quant_comm=post_quant_comm)
 
+        # Prepare additional information for profiling in case padding is applied when using alltoall.
+        # Only the non-alltoall case is considered for profiling in the warmup phase.
+        # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
         if self.enable_alltoall:
-            x, token_selected_slots, token_final_scales, alltoall_info = \
-                self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
-                                                     x,
-                                                     token_selected_slots,
-                                                     token_final_scales)
+            if all_rank_num_tokens is not None:
+                tuner_num_tokens = sum(all_rank_num_tokens)
+            else:
+                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            tuner_top_k = token_selected_slots.shape[1]
+        else:
+            tuner_num_tokens = None
+            tuner_top_k = None
 
-        x_sf = None
-        if self.has_any_quant:
-            if self.has_fp8_qdq:
-                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant)
-            elif self.has_nvfp4:
-                if not disable_fp4_allgather() or self.use_postquant_alltoall:
-                    if isinstance(x, Fp4QuantizedTensor):
-                        x, x_sf = x.fp4_tensor, x.scaling_factor
-                        x_row = x.shape[0]
-                        # note: we use uint8 to store 2 fp4 values
-                        x_col = x.shape[1] * 2
-                    else:
-                        x_row = x.shape[0]
-                        x_col = x.shape[1]
-                        x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size,
-                            False)
+        # Alltoall or allgather for attention DP
+        token_count = x.shape[0]
+        alltoall_info = None  # Store for later combine
+        is_sf_swizzled = True  # In case of post-quant communication, scaling factors will not be swizzled before communication, and swizzling after communication is merged into MoE.
+        if self.enable_alltoall:
+            assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
+            # Prepare alltoall indices
+            top_k = self.routing_method.experts_per_token
+            runtime_max_tokens_per_rank = max(
+                all_rank_num_tokens) if all_rank_num_tokens else token_count
 
-            elif self.has_fp8_block_scales:
-                use_fp8_block_scaling = True
-            elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
-                weight_dtype = torch.quint4x2
+            # Handle case where token_final_scales might be None (when apply_router_weight_on_input=True)
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_slots,
+                                                     dtype=torch.float32)
+
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
+                assert self.alltoall_prepare_workspace is not None, "alltoall_prepare_workspace should be initialized"
+                if is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                else:
+                    loadbalancer_local_statistic_info = None
+                alltoall_info, gathered_loadbalancer_local_statistic_info = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                    token_selected_slots, loadbalancer_local_statistic_info,
+                    self.alltoall_prepare_workspace,
+                    runtime_max_tokens_per_rank, self.ep_rank, self.ep_size,
+                    self.num_experts, self.num_slots, top_k)
+                if gathered_loadbalancer_local_statistic_info is not None:
+                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                        (self.mapping.moe_ep_size, self.num_experts))
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_loadbalancer_local_statistic_info)
+
+                # Dispatch x, x_sf, token_selected_slots, token_final_scales in one alltoall kernel
+                x, x_sf, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
+                    [x, x_sf, token_selected_slots, token_final_scales],
+                    alltoall_info, self.alltoall_workspace, self.ep_rank,
+                    self.ep_size)
+
+                torch.ops.trtllm.memset_expert_ids(
+                    token_selected_slots, alltoall_info.recv_rank_count_cumsum,
+                    runtime_max_tokens_per_rank, top_k, self.num_slots,
+                    self.ep_size)
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                # Python MoeAlltoAll path
+
+                payloads = []
+                payloads.append(x)
+                if x_sf is not None:
+                    payloads.append(x_sf)
+                    expert_id_payload_index = 2
+                else:
+                    expert_id_payload_index = 1
+                payloads.append(token_selected_slots)
+                payloads.append(token_final_scales)
+
+                loadbalancer_local_statistic_info = None
+                if self.layer_load_balancer and is_last_call:
+                    loadbalancer_local_statistic_info = self._load_balancer_get_local_statistic_tensor(
+                    )
+                if loadbalancer_local_statistic_info is not None:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_slots,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=self.
+                        num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                        eplb_local_stats=loadbalancer_local_statistic_info,
+                    )
+                    gathered_stats = self.moe_a2a._state.eplb_gathered_stats
+                    self._load_balancer_update_statistic_with_gathered_statistic(
+                        gathered_stats)
+                else:
+                    recv_tensors = self.moe_a2a.dispatch(
+                        token_selected_slots,
+                        payloads,
+                        runtime_max_tokens_per_rank,
+                        invalid_token_expert_id=self.
+                        num_slots,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
+                        expert_id_payload_index=expert_id_payload_index,
+                    )
+
+                if x_sf is not None:
+                    x_recv, x_sf_recv, token_selected_slots_recv, token_final_scales_recv = recv_tensors
+                    x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
+                else:
+                    x_recv, token_selected_slots_recv, token_final_scales_recv = recv_tensors
+                x = x_recv.view(-1, x_recv.shape[-1])
+                token_selected_slots = token_selected_slots_recv.view(
+                    -1, token_selected_slots_recv.shape[-1])
+                token_final_scales = token_final_scales_recv.view(
+                    -1, token_final_scales_recv.shape[-1])
             else:
                 raise ValueError(
-                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                    f"Unsupported moe alltoall method type: {self.alltoall_method_type}"
                 )
 
-        if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        ) and not self.enable_alltoall:
+        elif run_post_quant_allgather:
+            # Original allgather logic
+            # x_sf is already 2D after quantize_input with post_quant_comm=True
+
             x, x_sf, token_selected_slots, token_final_scales = allgather(
                 [x, x_sf, token_selected_slots, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
-            # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = reswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
 
-        if self.smart_router and not cutlass_min_latency_mode:
-            ep_size = self.cluster_size
-            ep_rank = self.cluster_rank
-            expert_start = ep_rank * self.num_experts // ep_size
-            expert_end = min(self.num_experts,
-                             (ep_rank + 1) * self.num_experts // ep_size)
-            w3_w1_weight = self.w3_w1_weight.narrow(0, expert_start,
-                                                    expert_end - expert_start)
-            w2_weight = self.w2_weight.narrow(0, expert_start,
-                                              expert_end - expert_start)
-            cluster_size = self.ep_size
-            cluster_rank = self.ep_rank
-            quant_scales = self.get_quant_scales(expert_start, expert_end)
-        else:
-            ep_size = self.ep_size
-            ep_rank = self.ep_rank
-            w3_w1_weight = self.w3_w1_weight
-            w2_weight = self.w2_weight
-            cluster_size = self.cluster_size
-            cluster_rank = self.cluster_rank
-            quant_scales = self.quant_scales
+        # Optionally provide an output tensor to fused_moe so it writes directly to our buffer
+        moe_output: Optional[torch.Tensor] = None
+        if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+            # Retrieve a workspace-backed output tensor sized by runtime tokens
+            runtime_max_tokens_per_rank = max(
+                all_rank_num_tokens) if all_rank_num_tokens else x.shape[0]
+            moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
+                runtime_max_tokens_per_rank, self.unpadded_hidden_size,
+                output_dtype)
 
-        if self.use_postquant_alltoall:
-            x, x_sf = self.alltoall_postquant_dispatch(x, x_sf, x_row, x_col,
-                                                       alltoall_info)
-
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight.view(weight_dtype),
-            w2_weight.view(weight_dtype),
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=x_sf,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            use_fp8_block_scaling=use_fp8_block_scaling,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
-            min_latency_mode=cutlass_min_latency_mode,
-            tune_max_num_tokens=self.tune_max_num_tokens,
+        # Call extracted run_moe method
+        final_hidden_states = self.run_moe(
+            x=x,
+            token_selected_experts=token_selected_slots,
+            token_final_scales=token_final_scales,
+            x_sf=x_sf,
+            is_sf_swizzled=not post_quant_comm,
+            output_dtype=output_dtype,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
+            moe_output=moe_output,
         )
 
-        if cutlass_min_latency_mode:
-            assert not self.reduce_results
-            return final_hidden_states
-        else:
-            # Custom op requires all inputs are in the same type.
-            # Only in cutlass_min_latency_mode, the output is a list of tensors.
-            # Otherwise, the output should be unpacked as a single tensor.
-            final_hidden_states = final_hidden_states[0]
+        self._load_balancer_start_set_cpu_stage(is_last_call)
 
-        if not self.enable_alltoall:
-            return final_hidden_states
-        else:
-            return self.alltoall_combine(final_hidden_states, alltoall_info,
-                                         token_count)
+        # Combine results if using alltoall
+        if self.enable_alltoall:
+            if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
+                if alltoall_info is not None:
+                    top_k = self.routing_method.experts_per_token
+                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                        final_hidden_states,
+                        alltoall_info,
+                        self.alltoall_workspace,
+                        ep_rank=self.ep_rank,
+                        ep_size=self.ep_size,
+                        top_k=top_k,
+                        use_low_precision_combine=self.
+                        use_low_precision_combine,
+                        token_count=token_count)
+            elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
+                output_hidden_size = final_hidden_states.shape[-1]
+                runtime_max_tokens_per_rank = max(
+                    all_rank_num_tokens) if all_rank_num_tokens else token_count
+                final_hidden_states = self.moe_a2a.combine(
+                    final_hidden_states.view(self.ep_size,
+                                             runtime_max_tokens_per_rank,
+                                             output_hidden_size),
+                    runtime_max_tokens_per_rank,
+                    payload_in_workspace=True)
+            else:
+                raise ValueError(
+                    f"Unsupported moe alltoall method type: {self.alltoall_method_type}"
+                )
 
-    def forward(
+        self._load_balancer_done_set_cpu_stage(is_last_call)
+
+        return final_hidden_states
+
+    def split_chunk(self, split_token_num: int, split_num_chunks: int):
+        val_div = split_token_num // split_num_chunks
+        val_mod = split_token_num % split_num_chunks
+        split_chunk_size_list = [val_div + 1] * val_mod + [val_div] * (
+            split_num_chunks - val_mod)
+        return split_chunk_size_list
+
+    def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
+        *,
+        do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        if self.use_dp:
+        assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
+        if self.use_dp and self.parallel_size > 1:
             assert all_rank_num_tokens is not None
             assert use_dp_padding is not None
             num_rows = sum(all_rank_num_tokens)
         else:
             num_rows = x.shape[0]
 
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
+                                          ] * len(all_rank_num_tokens)
+            num_rows = sum(all_rank_num_tokens_padded)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
+
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
 
-        if cutlass_min_latency_mode:
-            assert num_chunks == 1 and (
-                not self.reduce_results
-            ), "cutlass_min_latency_mode must be used with a single chunk and reduce_results must be False"
-
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
-                                          ] * len(all_rank_num_tokens)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
         if num_chunks == 1:
+            is_first_call = self.repeat_idx == 0
+            is_last_call = self.repeat_idx == self.repeat_count - 1
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                use_dp_padding=use_dp_padding,
+                repeating_info=(is_first_call, is_last_call))
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding)
         else:
-
-            def split_chunk(split_token_num: int, split_num_chunks: int):
-                val_div = split_token_num // split_num_chunks
-                val_mod = split_token_num % split_num_chunks
-                split_chunk_size_list = [val_div + 1] * val_mod + [val_div] * (
-                    split_num_chunks - val_mod)
-                return split_chunk_size_list
-
             if self.use_dp:
                 all_rank_chunk_size_list = [
-                    split_chunk(val, num_chunks)
+                    self.split_chunk(val, num_chunks)
                     for val in all_rank_num_tokens_padded
                 ]
                 all_rank_num_tokens_list = [[
                     val[idx_chunk] for val in all_rank_chunk_size_list
                 ] for idx_chunk in range(num_chunks)]
-                chunk_size_list = all_rank_chunk_size_list[self.rank]
-                if self.enable_alltoall:
-                    all_rank_num_tokens_list = [[
-                        1 if val == 0 else val for val in val_list
-                    ] for val_list in all_rank_num_tokens_list]
+                chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
             else:
                 all_rank_num_tokens_list = [None] * num_chunks
-                chunk_size_list = split_chunk(x.shape[0], num_chunks)
+                chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
 
-            if not self.enable_alltoall:
-                self.event_dict[EventType.Main].record()
-                with torch.cuda.stream(self.aux_stream):
-                    self.event_dict[EventType.Main].wait()
+            self.event_dict[EventType.Main].record()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+
+            def _forward_chunk(x_, router_logits_, idx):
+                is_first_call = idx == 0 and self.repeat_idx == 0
+                is_last_call = idx == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
+                return self.forward_chunk(
+                    x_,
+                    router_logits_,
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
+                    if self.use_dp else None,
+                    use_dp_padding=use_dp_padding,
+                    repeating_info=(is_first_call, is_last_call))
+
+            def _reducescatter_or_allreduce(x_, idx):
+                return self.reducescatter_or_allreduce(
+                    x_,
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
+                    use_dp_padding=use_dp_padding)
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
-                if not self.enable_alltoall:
+                if not (self.alltoall_method_type
+                        == AlltoallMethodType.NVLinkOneSided
+                        or self.alltoall_method_type
+                        == AlltoallMethodType.NVLinkTwoSided):
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
-                            outputs = self.forward_chunk(
-                                x,
-                                router_logits,
-                                all_rank_num_tokens=all_rank_num_tokens_list[
-                                    idx_chunk] if self.use_dp else None,
-                                use_dp_padding=use_dp_padding)
+                            outputs = _forward_chunk(x, router_logits,
+                                                     idx_chunk)
                         if idx_chunk > 0:
-                            outputs_list[-1] = self.reducescatter_or_allreduce(
-                                outputs_list[-1],
-                                all_rank_num_tokens=all_rank_num_tokens_list[
-                                    idx_chunk - 1],
-                                use_dp_padding=use_dp_padding)
+                            outputs_list[-1] = _reducescatter_or_allreduce(
+                                outputs_list[-1], idx_chunk - 1)
                     else:
-                        outputs = self.forward_chunk(
-                            x,
-                            router_logits,
-                            all_rank_num_tokens=all_rank_num_tokens_list[
-                                idx_chunk] if self.use_dp else None,
-                            use_dp_padding=use_dp_padding)
+                        outputs = _forward_chunk(x, router_logits, idx_chunk)
                         with torch.cuda.stream(self.aux_stream):
-                            outputs_list[-1] = self.reducescatter_or_allreduce(
-                                outputs_list[-1],
-                                all_rank_num_tokens=all_rank_num_tokens_list[
-                                    idx_chunk - 1],
-                                use_dp_padding=use_dp_padding)
+                            outputs_list[-1] = _reducescatter_or_allreduce(
+                                outputs_list[-1], idx_chunk - 1)
                 else:
-                    outputs = self.forward_chunk(
-                        x,
-                        router_logits,
-                        all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk]
-                        if self.use_dp else None)
+                    outputs = _forward_chunk(x, router_logits, idx_chunk)
 
                 outputs_list.append(outputs)
-            if not self.enable_alltoall:
+
+            if not (self.alltoall_method_type
+                    == AlltoallMethodType.NVLinkOneSided
+                    or self.alltoall_method_type
+                    == AlltoallMethodType.NVLinkTwoSided):
                 if num_chunks % 2 == 0:
-                    outputs_list[-1] = self.reducescatter_or_allreduce(
-                        outputs_list[-1],
-                        all_rank_num_tokens=all_rank_num_tokens_list[-1],
-                        use_dp_padding=use_dp_padding)
+                    outputs_list[-1] = _reducescatter_or_allreduce(
+                        outputs_list[-1], -1)
                 else:
                     with torch.cuda.stream(self.aux_stream):
-                        outputs_list[-1] = self.reducescatter_or_allreduce(
-                            outputs_list[-1],
-                            all_rank_num_tokens=all_rank_num_tokens_list[-1],
-                            use_dp_padding=use_dp_padding)
+                        outputs_list[-1] = _reducescatter_or_allreduce(
+                            outputs_list[-1], -1)
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.MoeChunkingOverlap].record()
                 self.event_dict[EventType.MoeChunkingOverlap].wait()
+
             outputs = torch.cat(outputs_list)
-        if self.use_dp:
-            rank = self.mapping.tp_rank
+
+        if self.use_dp and self.parallel_size > 1:
+            rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
+        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
 
-    def alltoall_prepare_maybe_dispatch(self, all_rank_num_tokens: list,
-                                        x: torch.Tensor,
-                                        token_selected_slots: torch.Tensor,
-                                        token_final_scales: torch.Tensor):
-        top_k = self.routing_method.experts_per_token
-        expert_count = self.num_experts
-        # gather router info
-        max_num_token = max(all_rank_num_tokens)
-        token_selected_slots = torch.nn.functional.pad(
-            token_selected_slots,
-            (0, 0, 0, max_num_token - token_selected_slots.shape[0]),
-            'constant', self.num_experts)
-        token_final_scales = torch.nn.functional.pad(
-            token_final_scales,
-            (0, 0, 0, max_num_token - token_final_scales.shape[0]))
-        gathered_token_selected_slots, gathered_token_final_scales = allgather(
-            [token_selected_slots, token_final_scales], self.mapping, dim=0)
-        gathered_token_selected_slots = torch.flatten(
-            gathered_token_selected_slots.contiguous(), start_dim=0, end_dim=-2)
-        gathered_token_final_scales = torch.flatten(
-            gathered_token_final_scales.contiguous(), start_dim=0, end_dim=-2)
-        gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
-            gathered_token_selected_slots, self.num_experts, self.ep_size)
-        alltoall_info, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
-            gathered_target_rank_ids, None, gathered_token_selected_slots,
-            gathered_token_final_scales, max_num_token, expert_count, top_k,
-            self.ep_rank, self.ep_size)
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        return super().forward_fake(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+            **kwargs,
+        )
 
-        if not self.use_postquant_alltoall:
-            assert not isinstance(
-                x, Fp4QuantizedTensor
-            ), "pre-quant alltoall doesn't support fp4 tensor"
-            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
-                                             self.alltoall_workspace,
-                                             self.ep_rank, self.ep_size)
-
-        return x, token_selected_slots, token_final_scales, alltoall_info
-
-    def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
-                                    x_row: int, x_col: int,
-                                    alltoall_info: MoEAlltoallInfo):
-        x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
-                                         self.alltoall_workspace, self.ep_rank,
-                                         self.ep_size)
-
-        if x_sf is not None:
-            if self.has_nvfp4:
-                x_sf = unswizzle_sf(x_sf, x_row, x_col,
-                                    self.scaling_vector_size)
-
-            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
-                                                self.alltoall_workspace,
-                                                self.ep_rank, self.ep_size)
-
-            if self.has_nvfp4:
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
-
-        return x, x_sf
-
-    def alltoall_combine(self, final_hidden_states: torch.Tensor,
-                         alltoall_info: MoEAlltoallInfo, token_count: int):
-        top_k = self.routing_method.experts_per_token
-        if isinstance(final_hidden_states, list):
-            final_hidden_states = final_hidden_states[0]
-        final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
-            final_hidden_states,
-            alltoall_info,
-            self.alltoall_workspace,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-            top_k=top_k,
-            token_count=token_count)
-
-        return final_hidden_states
-
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(
+                self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
+                                       **kargs)
+
+    def post_load_weights(self):
+        self.quant_method.post_load_weights(self)

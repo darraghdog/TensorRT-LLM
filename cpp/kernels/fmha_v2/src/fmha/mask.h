@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -478,7 +483,7 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3>
     inline __device__ bool is_valid(int row, int col) const
     {
         // Is it a valid position in the sequence, i.e. are we in the lower triangle?
-        return (row >= col) && (col >= max(0, row - sliding_window_size_));
+        return (row >= col) && (col >= max(0, row + 1 - sliding_window_size_));
     }
 
     // The sliding window size.
@@ -946,7 +951,7 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
     inline __device__ bool is_valid(int row, int col) const
     {
         // Is it a valid position in the sequence?
-        return col <= row && col >= max(0, row - sliding_window_size_);
+        return col <= row && col >= max(0, row + 1 - sliding_window_size_);
     }
 
     // The sliding window size for attention.

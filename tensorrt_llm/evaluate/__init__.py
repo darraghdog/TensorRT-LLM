@@ -14,9 +14,13 @@
 # limitations under the License.
 
 from .cnn_dailymail import CnnDailymail
-from .lm_eval import GSM8K, GPQADiamond, GPQAExtended, GPQAMain
+from .json_mode_eval import JsonModeEval
+from .lm_eval import (GSM8K, MMMU, GPQADiamond, GPQAExtended, GPQAMain,
+                      LongBenchV1)
+from .longbench_v2 import LongBenchV2
 from .mmlu import MMLU
 
 __all__ = [
-    "CnnDailymail", "MMLU", "GSM8K", "GPQADiamond", "GPQAMain", "GPQAExtended"
+    "CnnDailymail", "MMLU", "GSM8K", "GPQADiamond", "GPQAMain", "GPQAExtended",
+    "JsonModeEval", "MMMU", "LongBenchV1", "LongBenchV2"
 ]

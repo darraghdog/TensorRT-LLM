@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # NOTE: this file is for cubin generation, should not in final code release.
 
@@ -81,6 +86,9 @@ cpp_file_prefix_text = R"""/*
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
+
+#include "tensorrt_llm/common/config.h"
+
 namespace tensorrt_llm
 {
 namespace kernels
@@ -91,7 +99,7 @@ namespace kernels
 cpp_file_suffex_text = R"""
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
+}
 """
 
 cubin_meta_info_struct_prefix_text = R"""
@@ -117,12 +125,12 @@ cubin_meta_info_struct_suffix_text = R"""
 };
 """
 
-is_medusa = False
+is_spec_dec = False
 
 
 def generate_cubin_meta_info_line(arch: int, compile_macros: List[CompileMacro],
                                   function_name: str, cubin_size: int,
-                                  is_last: bool, is_medusa: bool):
+                                  is_last: bool, is_spec_dec: bool):
     data_type_str = None
     kv_data_type_str = None
     head_dim = None
@@ -160,7 +168,7 @@ def generate_cubin_meta_info_line(arch: int, compile_macros: List[CompileMacro],
             assert (tokens_per_page % 2 == 0)
             paged_kv_cache = 'true' if tokens_per_page > 0 else 'false'
 
-    use_medusa = 'true' if is_medusa else 'false'
+    use_medusa = 'true' if is_spec_dec else 'false'
     assert data_type_str is not None
     assert kv_data_type_str is not None
     assert head_dim is not None
@@ -376,7 +384,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                     option_macro_names, option_short_names, option_combination)
             ]
             if arch in (90, ) and option_combination[
-                    3] == 2 and option_combination[2] == 1 and not is_medusa:
+                    3] == 2 and option_combination[2] == 1 and not is_spec_dec:
                 input_file_name = "mha_sm90.cu"
             else:
                 input_file_name = "mha.cu"
@@ -387,7 +395,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
 
 def generate_header_file_contents(
         all_arch_macros: List[CompileArchMacrosAndFile],
-        name_size_list: List[Tuple[str, int]], is_medusa: bool):
+        name_size_list: List[Tuple[str, int]], is_spec_dec: bool):
     cubin_data_array = []
     cubin_length_array = []
     meta_line_array = []
@@ -406,7 +414,7 @@ def generate_header_file_contents(
             generate_cubin_meta_info_line(arch, macros, function_name,
                                           cubin_size,
                                           i == len(all_arch_macros) - 1,
-                                          is_medusa))
+                                          is_spec_dec))
     cubin_data = ''.join(cubin_data_array)
     cubin_length = ''.join(cubin_length_array)
     meta_struct = ''.join([
@@ -422,8 +430,8 @@ if __name__ == "__main__":
         shutil.rmtree(cubin_dir)
     os.mkdir(cubin_dir)
 
-    if len(sys.argv) > 1 and sys.argv[1] == 'medusa':
-        is_medusa = True
+    if len(sys.argv) > 1 and sys.argv[1] == 'spec_dec':
+        is_spec_dec = True
         nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG -DSPEC_DEC --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
         arch_options = [80, 86, 89, 90]
         config_list = [[
@@ -431,8 +439,9 @@ if __name__ == "__main__":
             CompileMacroOption('HEAD_ELEMS', 'd', [128]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 1, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                               [0, 64, 128]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption(
+                'TOKENS_PER_PAGE', 'pagedKV',
+                [0, 32, 64, 128]),  # 0 denotes contiguous kv cache.
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [16, 32]),
         ]]
@@ -444,7 +453,7 @@ if __name__ == "__main__":
     with multiprocessing.Pool(processes=thread_count) as pool:
         name_size_list = pool.map(run_cubin_gen, arch_macro_lists)
     header_file_contents = generate_header_file_contents(
-        arch_macro_lists, name_size_list, is_medusa)
+        arch_macro_lists, name_size_list, is_spec_dec)
 
     with open(cubin_dir + build_func_name_prefix + '_cubin.h', "w") as f:
         f.write("".join(

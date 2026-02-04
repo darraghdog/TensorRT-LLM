@@ -1,8 +1,11 @@
 import os
 import subprocess  # nosec B404
 import sys
+import threading
 from subprocess import PIPE, Popen
 from typing import Literal
+
+cur_dir = os.path.dirname(os.path.abspath(__file__))
 
 import pytest
 
@@ -10,6 +13,11 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
                                              split_mpi_env)
+
+# isort: off
+sys.path.append(os.path.join(cur_dir, '..'))
+from utils.util import skip_single_gpu
+# isort: on
 
 
 def task0():
@@ -53,35 +61,47 @@ def run_client(server_addr, values_to_process):
         return f"Error in client: {str(e)}"
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
-    os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
-    os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = "ipc://" + str(
-        os.getpid())
-
-    command = [
-        "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",
-        "python3", "_run_mpi_comm_task.py", "--task_type", task_type
-    ]
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    test_file = os.path.join(cur_dir, "_test_remote_mpi_session.sh")
+    assert os.path.exists(test_file), f"Test file {test_file} does not exist"
+    command = ["bash", test_file, task_type]
     print(' '.join(command))
+
     with Popen(command,
                env=os.environ,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,
-               universal_newlines=True) as process:
-        # Process both stdout and stderr in real-time
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+               start_new_session=True,
+               universal_newlines=True,
+               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
 
-        for line in process.stderr:
-            sys.stderr.write(line)
-            sys.stderr.flush()
+        # Function to read from a stream and write to output
+        def read_stream(stream, output_stream):
+            for line in stream:
+                output_stream.write(line)
+                output_stream.flush()
 
+        # Create threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=read_stream,
+                                         args=(process.stdout, sys.stdout))
+        stderr_thread = threading.Thread(target=read_stream,
+                                         args=(process.stderr, sys.stderr))
+
+        # Start both threads
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
         return_code = process.wait()
+
+        # Wait for both threads to finish reading
+        stdout_thread.join()
+        stderr_thread.join()
+
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
 
@@ -95,3 +115,54 @@ def task1():
 def test_split_mpi_env():
     session = MpiPoolSession(n_workers=4)
     session.submit_sync(task1)
+
+
+@skip_single_gpu
+@pytest.mark.parametrize(
+    "task_script", ["_run_mpi_comm_task.py", "_run_multi_mpi_comm_tasks.py"])
+def test_llmapi_launch_multiple_tasks(task_script: str):
+    """
+    Test that the trtllm-llmapi-launch can run multiple tasks.
+    """
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    test_file = os.path.join(cur_dir, "_run_multi_llm_tasks.py")
+    assert os.path.exists(test_file), f"Test file {test_file} does not exist"
+    command = [
+        "mpirun", "-n", "2", "--allow-run-as-root", "trtllm-llmapi-launch",
+        "python3", test_file
+    ]
+    print(' '.join(command))
+
+    with Popen(command,
+               env=os.environ,
+               stdout=PIPE,
+               stderr=PIPE,
+               bufsize=1,
+               start_new_session=True,
+               universal_newlines=True,
+               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
+        # Function to read from a stream and write to output
+        def read_stream(stream, output_stream):
+            for line in stream:
+                output_stream.write(line)
+                output_stream.flush()
+
+        # Create threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=read_stream,
+                                         args=(process.stdout, sys.stdout))
+        stderr_thread = threading.Thread(target=read_stream,
+                                         args=(process.stderr, sys.stderr))
+
+        # Start both threads
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
+        return_code = process.wait()
+
+        # Wait for both threads to finish reading
+        stdout_thread.join()
+        stderr_thread.join()
+
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)

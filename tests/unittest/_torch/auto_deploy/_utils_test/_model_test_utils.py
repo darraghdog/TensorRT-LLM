@@ -1,12 +1,11 @@
 import copy
-import os
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
+from test_common.llm_data import hf_id_to_local_model_dir
 from torch import nn
 from torch.export import Dim
-from utils.llm_data import llm_models_root
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -184,7 +183,7 @@ class MoEOpModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: Tensor of shape (batch, hidden_size)
-        Computes router logits via a gate, and then calls the MoE op via torch.moe.torch_moe.
+        Computes router logits via a gate, and then calls the MoE op via torch.ops.auto_deploy.torch_moe.
         """
 
         router_logits = self.gate(x)
@@ -197,7 +196,7 @@ class MoEOpModel(nn.Module):
         w2_list = [expert.w2 for expert in self.experts]
         w3_list = [expert.w3 for expert in self.experts]
 
-        out = torch.ops.moe.torch_moe(
+        out = torch.ops.auto_deploy.torch_moe(
             x, selected_experts, routing_weights, w1_list, w2_list, w3_list
         )
         return out
@@ -206,24 +205,83 @@ class MoEOpModel(nn.Module):
         return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
 
 
+class BMM(nn.Module):
+    """Expert model with BMM operations for testing."""
+
+    # using hidden_size for both weight dimensions to simplify the test
+    def __init__(self, hidden_dim, batch_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+        # Create parameter weights for BMM
+        self.weight1 = nn.Parameter(torch.randn(batch_size, hidden_dim, hidden_dim))
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, embed_dim]
+        return torch.bmm(x, self.weight1)
+
+
+class BMMModel(nn.Module):
+    """Simple model with BMM operations for testing."""
+
+    def __init__(self, hidden_dim, batch_size, num_experts):
+        super().__init__()
+        self.experts = nn.ModuleList([BMM(hidden_dim, batch_size) for _ in range(num_experts)])
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, embed_dim]
+        return torch.cat([expert(x) for expert in self.experts], dim=1)
+
+
+class BMMDynamicModel(nn.Module):
+    """BMM model with dynamic tensor weights for testing."""
+
+    def __init__(self, hidden_dim, batch_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+        # Create a linear layer to generate dynamic weights
+        self.weight = nn.Parameter(torch.randn(batch_size, hidden_dim * hidden_dim))
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, hidden_dim]
+        batch_size, seq_len, hidden_dim = x.shape
+
+        # Generate dynamic weights from input
+        dynamic_weights = self.weight.view(batch_size, hidden_dim, hidden_dim)
+        return torch.bmm(x, dynamic_weights)
+
+
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+class FakeFP8Linear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        device = self.weight.device
+        amax = self.weight.detach().abs().max().to(torch.float)
+        eps = torch.finfo(torch.float32).tiny
+        weight_scale = torch.clamp(amax / FP8_MAX, min=eps).to(device)
+        self.weight = nn.Parameter((self.weight / weight_scale).to(torch.float8_e4m3fn))
+        self.register_buffer(
+            "input_scale", torch.tensor(1.0, device=self.weight.device, dtype=torch.float)
+        )
+        self.register_buffer("weight_scale", weight_scale)
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
+            x, self.weight, self.bias, [self.input_scale], [self.weight_scale], [], []
+        )
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {
-            0: Dim("batch_size", max=max_batch_size),
-            1: Dim("seq_len", max=max_seq_len),
+            0: Dim.DYNAMIC,
+            1: Dim.DYNAMIC,
         },
     )
     return dynamic_shapes
-
-
-def _hf_model_dir_or_hub_id(
-    hf_model_dir: str,
-    hf_hub_id: str,
-) -> str:
-    if os.path.isdir(hf_model_dir):
-        return hf_model_dir
-    else:
-        return hf_hub_id
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -253,9 +311,10 @@ def apply_rotary_pos_emb_complex(
     xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     # Multiply with frequencies. Note that freqs_cis is expected to broadcast with an extra head dim.
-    freqs = freqs_cis.unsqueeze(unsqueeze_dim)
-    xq_out = torch.view_as_real(xq_complex * freqs).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs).flatten(3)
+    freqs_q = freqs_cis.unsqueeze(unsqueeze_dim)
+    freqs_k = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_complex * freqs_q).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_k).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -280,10 +339,6 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 _SMALL_MODEL_CONFIGS = {
     "meta-llama/Meta-Llama-3.1-8B-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-        ),
         "model_kwargs": {
             "num_hidden_layers": 1,
             "hidden_size": 64,
@@ -293,23 +348,26 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        ),
         "model_kwargs": {
             "num_hidden_layers": 2,
             "intermediate_size": 256,
+            "hidden_size": 64,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "num_local_experts": 2,
         },
     },
+    "Qwen/Qwen3-30B-A3B": {
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "intermediate_size": 256,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_experts": 16,
+        },
+    },
     "microsoft/Phi-3-mini-4k-instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
-            "microsoft/Phi-3-mini-4k-instruct",
-        ),
         "model_kwargs": {
             "num_hidden_layers": 2,
             "hidden_size": 128,
@@ -319,12 +377,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-        ),
         "model_factory": "AutoModelForImageTextToText",
-        "customize_tokenizer": True,
         "model_kwargs": {
             "text_config": {
                 "num_hidden_layers": 1,
@@ -338,17 +391,10 @@ _SMALL_MODEL_CONFIGS = {
             },
             "vision_config": {
                 "num_hidden_layers": 1,
-                "hidden_size": 64,
-                "intermediate_size": 64,
-                "num_attention_heads": 2,
             },
         },
     },
     "deepseek-ai/DeepSeek-V3": {
-        "model": _hf_model_dir_or_hub_id(
-            f"{llm_models_root()}/DeepSeek-V3",
-            "deepseek-ai/DeepSeek-V3",
-        ),
         "model_kwargs": {
             "first_k_dense_replace": 1,
             "num_hidden_layers": 2,
@@ -362,14 +408,91 @@ _SMALL_MODEL_CONFIGS = {
             "n_shared_experts": 1,
             "num_attention_heads": 8,
             "num_key_value_heads": 2,
-            "num_experts_per_token": 2,
+            "num_experts_per_tok": 2,
             "q_lora_rank": 128,
         },
+    },
+    "Qwen/Qwen2.5-3B-Instruct": {
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
+        "model_factory": "AutoModelForImageTextToText",
+        "model_kwargs": {
+            "text_config": {
+                "num_hidden_layers": 2,
+                "head_dim": 64,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+            },
+            "vision_config": {
+                "num_hidden_layers": 1,
+                "hidden_size": 64,
+                "head_dim": 32,
+                "image_size": 128,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+            },
+        },
+    },
+    "ibm-ai-platform/Bamba-9B-v2": {
+        "model_kwargs": {
+            "dtype": "bfloat16",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "mamba_chunk_size": 64,
+            "mamba_d_conv": 2,
+            "mamba_d_head": 16,
+            "mamba_d_state": 64,
+            "mamba_expand": 1,
+            "mamba_n_groups": 1,
+            "mamba_n_heads": 4,
+            "model_type": "bamba",
+            "num_hidden_layers": 10,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
+    "nvidia/NVIDIA-Nemotron-Nano-12B-v2": {
+        "model_kwargs": {
+            "dtype": "bfloat16",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "mamba_head_dim": 40,
+            "mamba_num_heads": 4,
+            "n_groups": 2,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 9,
+            "num_key_value_heads": 2,
+            "ssm_state_size": 32,
+        },
+    },
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+        },
+    },
+    "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024": {
+        "model_kwargs": {
+            "num_hidden_layers": 8,
+        },
+    },
+    "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
+        "model_kwargs": {
+            "hidden_size": 64,
+        }
     },
 }
 
 
-def get_small_model_config(model_hub_id: str, **config_kwargs) -> Dict[str, Any]:
+def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:
     """
     Get the small model configuration for a given HuggingFace model hub ID.
 
@@ -386,18 +509,29 @@ def get_small_model_config(model_hub_id: str, **config_kwargs) -> Dict[str, Any]
         available_models = list(_SMALL_MODEL_CONFIGS.keys())
         raise KeyError(f"Model '{model_hub_id}' not found. Available models: {available_models}")
 
-    config = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
+    llm_args = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
 
-    # add default values for small model config
-    config["skip_loading_weights"] = True  # No weight loading to speed up things
-    config["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
-    config["benchmark"] = False  # No benchmark to speed up things
-    config["max_tokens"] = 8  # Don't produce too many tokens to speed up things
-    config["page_size"] = 4  # Make sure paging is activated despite small max_tokens
-    config["max_batch_size"] = 2  # Minimum batching to speed up things
-    config["prompt"] = "Hello World"
+    # convert HF ID to local model directory
+    llm_args["model"] = hf_id_to_local_model_dir(model_hub_id)
 
-    # add custom config kwargs
-    config.update(config_kwargs)
+    # add some defaults to llm_args
+    llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
+    llm_args["kv_cache_config"] = {
+        "tokens_per_block": 4,  # Make sure paging is activated despite small max_tokens
+        "free_gpu_memory_fraction": 0.0,  # No resizing of the cache to keep the mem footprint small
+    }
+    llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
+    # update with custom llm_args kwargs
+    llm_args.update(llm_args_kwargs)
 
-    return config
+    # add a couple of other defaults to the experiment config
+    experiment_config = {
+        "args": llm_args,
+        "benchmark": {"enabled": False},
+        "prompt": {
+            "queries": "Hello World",
+            "sp_kwargs": {"max_tokens": 8},
+        },
+    }
+
+    return experiment_config

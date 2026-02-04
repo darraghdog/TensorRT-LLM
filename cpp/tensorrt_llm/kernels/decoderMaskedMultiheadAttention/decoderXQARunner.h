@@ -20,6 +20,7 @@
 #include <cuda_fp16.h>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObjRegistry.h"
@@ -32,8 +33,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -69,6 +70,8 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 };
 #endif
 
+class DecoderXQARunnerResource;
+
 class DecoderXQARunner
 {
 public:
@@ -95,8 +98,7 @@ public:
         this->run(xqa_params, kv_cache_buffer, stream);
     }
 
-    class Resource;
-    static Resource* getResourceGlobal();
+    static std::shared_ptr<DecoderXQARunnerResource> getResourceGlobal();
 
 private:
     void prepareForRun(XQAParams const& xqa_params);
@@ -120,20 +122,20 @@ private:
     friend DecoderXQAImplJIT;
 };
 
-class DecoderXQARunner::Resource
+class DecoderXQARunnerResource
 {
 public:
-    Resource();
-    Resource(Resource const& other);
-    Resource& operator=(Resource const& other);
-    Resource(Resource&& other) = default;
-    Resource& operator=(Resource&& other) = default;
+    DecoderXQARunnerResource();
+    DecoderXQARunnerResource(DecoderXQARunnerResource const& other);
+    DecoderXQARunnerResource& operator=(DecoderXQARunnerResource const& other);
+    DecoderXQARunnerResource(DecoderXQARunnerResource&& other) = default;
+    DecoderXQARunnerResource& operator=(DecoderXQARunnerResource&& other) = default;
     // Construct from a serialized buffer.
-    Resource(void const* buffer, size_t buffer_size);
-    ~Resource() = default;
+    DecoderXQARunnerResource(void const* buffer, size_t buffer_size);
+    ~DecoderXQARunnerResource() = default;
 
     // When initialize is true, initialize cubins.
-    void merge(Resource const& other, bool initialize)
+    void merge(DecoderXQARunnerResource const& other, bool initialize)
     {
         getCubinObjRegistry()->merge(*other.getCubinObjRegistry(), initialize);
     }
@@ -156,4 +158,5 @@ private:
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

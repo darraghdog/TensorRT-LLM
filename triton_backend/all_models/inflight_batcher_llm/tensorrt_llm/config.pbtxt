@@ -283,6 +283,20 @@ input [
     optional: true
   },
   {
+    name: "return_num_input_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
+    name: "return_num_output_tokens"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
     name: "exclude_input_in_output"
     data_type: TYPE_BOOL
     dims: [ 1 ]
@@ -305,7 +319,7 @@ input [
   },
   {
     name: "prompt_embedding_table"
-    data_type: TYPE_FP16
+    data_type: ${prompt_embedding_table_data_type}
     dims: [ -1, -1 ]
     optional: true
     allow_ragged_batch: true
@@ -575,6 +589,16 @@ output [
     name: "total_draft_tokens"
     data_type: TYPE_INT32
     dims: [ 1 ]
+  },
+  {
+    name: "num_input_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "num_output_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
   }
 ]
 instance_group [
@@ -662,13 +686,13 @@ parameters: {
     string_value: "${kv_cache_onboard_blocks}"
   }
 }
-# enable_trt_overlap is deprecated and doesn't have any effect on the runtime
-# parameters: {
-#   key: "enable_trt_overlap"
-#   value: {
-#     string_value: "${enable_trt_overlap}"
-#   }
-# }
+# enable_trt_overlap is an experimental feature used with CUDA Graph Mode.
+parameters: {
+  key: "enable_trt_overlap"
+  value: {
+    string_value: "${enable_trt_overlap}"
+  }
+}
 parameters: {
   key: "exclude_input_in_output"
   value: {

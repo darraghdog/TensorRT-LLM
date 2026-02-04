@@ -16,15 +16,18 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 constexpr size_t WARP_SIZE = 32;
@@ -56,6 +59,8 @@ enum class AllReduceStrategyType : int8_t
     ONESHOT = 4,
     TWOSHOT = 5,
     LOWPRECISION = 6,
+    MNNVL = 7,
+    NCCL_SYMMETRIC = 8,
 };
 
 enum class AllReduceStrategyConfig : int8_t
@@ -74,7 +79,7 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
-    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -89,13 +94,39 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: os << "RESIDUAL_RMS_NORM_QUANT_NVFP4"; break;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: os << "RESIDUAL_RMS_NORM_OUT_QUANT_FP8"; break;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: os << "RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4"; break;
-    case AllReduceFusionOp::MOE_ALLREDUCE_RESIDUAL_RMS_NORM: os << "MOE_ALLREDUCE_RESIDUAL_RMS_NORM"; break;
+    case AllReduceFusionOp::MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM:
+        os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
+        break;
     default: os << "UNKNOWN"; break;
     }
     return os;
 }
 
 inline std::string toString(AllReduceFusionOp op)
+{
+    std::ostringstream oss;
+    oss << op;
+    return oss.str();
+}
+
+inline std::ostream& operator<<(std::ostream& os, AllReduceStrategyType op)
+{
+    switch (op)
+    {
+    case AllReduceStrategyType::NCCL: os << "NCCL"; break;
+    case AllReduceStrategyType::MIN_LATENCY: os << "MIN_LATENCY"; break;
+    case AllReduceStrategyType::UB: os << "UB"; break;
+    case AllReduceStrategyType::AUTO: os << "AUTO"; break;
+    case AllReduceStrategyType::ONESHOT: os << "ONESHOT"; break;
+    case AllReduceStrategyType::TWOSHOT: os << "TWOSHOT"; break;
+    case AllReduceStrategyType::LOWPRECISION: os << "LOWPRECISION"; break;
+    case AllReduceStrategyType::MNNVL: os << "MNNVL"; break;
+    case AllReduceStrategyType::NCCL_SYMMETRIC: os << "NCCL_SYMMETRIC"; break;
+    }
+    return os;
+}
+
+inline std::string toString(AllReduceStrategyType op)
 {
     std::ostringstream oss;
     oss << op;
@@ -164,4 +195,6 @@ namespace reduce_fusion
 bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

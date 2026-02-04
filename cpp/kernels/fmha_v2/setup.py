@@ -1,12 +1,17 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 import subprocess
@@ -101,6 +106,7 @@ class InputLayout(IntEnum):
     PACKED_QKV = 0
     CONTIGUOUS_Q_KV = 1
     Q_PAGED_KV = 2
+    SEPARATE_Q_K_V = 3
 
 
 spec_fields = (
@@ -148,7 +154,9 @@ spec_fields = (
     'head_size_v',
     'sage_block_sizes',
     'output_dtype',
-    'is_mtp')
+    'is_mtp',
+    'enable_skip_softmax',
+)
 kernel_spec = namedtuple('kernel_spec', spec_fields)
 kernel_spec.__new__.__defaults__ = (
     1,  # ctas_per_head
@@ -173,7 +181,9 @@ kernel_spec.__new__.__defaults__ = (
     0,  # head size of V
     None,  # sage_block_sizes
     None,  # output_dtype, same as dtype by default.
-    False)  # use MTP or not
+    False,  # use MTP or not
+    False,  # enable skip softmax
+)
 
 generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
                                     'False').lower() == 'true'
@@ -194,38 +204,22 @@ ns_close = r"""
 
 copyright = '''\
 /***************************************************************************************************
- * Copyright (c) 2011-2023, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Redistribution and use in source and binary forms, with or without modification, are not permit-
- * ted.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  **************************************************************************************************/
-''' if not generate_cu_trtllm else r"""/*
-* SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
-* AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
-"""
+'''
 
 makefile_template = '''\
 
@@ -1344,7 +1338,7 @@ void {sliding_or_chunked_causal_kernel_name}_nl({params_type} params){{
 
 #endif // sliding_or_chunked_causal_mask
 
-void {launcher_name}_nl({params_type} &params,
+void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     const Launch_params& launch_params, cudaStream_t stream){{
   constexpr int loop_iters = {seq_len} / {noloop_step};
   static_assert(loop_iters * {noloop_step} == {seq_len}, "");
@@ -1431,6 +1425,7 @@ using Ktraits = {kernel_traits_header}
                 {loop_step},
                 {kv_loop_step},
                 {head_size},
+                {head_size_v},
                 {q_tile_buffers},
                 {kv_tile_buffers},
                 NUM_COMPUTE_GROUPS,
@@ -1444,6 +1439,7 @@ using Ktraits = {kernel_traits_header}
                 USE_TMA_STORE,
                 {enable_attn_logit_softcapping_flag},
                 {return_softmax_stats_flag},
+                {enable_skip_softmax_flag},
                 {output_dtype_},
                 {sage_block_size_q},
                 {sage_block_size_k},
@@ -1453,6 +1449,7 @@ using Ktraits_causal = {kernel_traits_header}
                        {loop_step},
                        {kv_loop_step},
                        {head_size},
+                       {head_size_v},
                        {q_tile_buffers},
                        {kv_tile_buffers},
                        NUM_COMPUTE_GROUPS,
@@ -1466,12 +1463,14 @@ using Ktraits_causal = {kernel_traits_header}
                        USE_TMA_STORE,
                        {enable_attn_logit_softcapping_flag},
                        {return_softmax_stats_flag},
+                       {enable_skip_softmax_flag},
                        {output_dtype_}>;
 
 using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {loop_step},
                                       {kv_loop_step},
                                       {head_size},
+                                      {head_size_v},
                                       {q_tile_buffers},
                                       {kv_tile_buffers},
                                       NUM_COMPUTE_GROUPS,
@@ -1485,12 +1484,14 @@ using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       USE_TMA_STORE && false,
                                       {enable_attn_logit_softcapping_flag},
                                       {return_softmax_stats_flag},
+                                      {enable_skip_softmax_flag},
                                       {output_dtype_}>;
 
 using Ktraits_custom_mask = {kernel_traits_header}
                             {loop_step},
                             {kv_loop_step},
                             {head_size},
+                            {head_size_v},
                             {q_tile_buffers},
                             {kv_tile_buffers},
                             NUM_COMPUTE_GROUPS,
@@ -1504,6 +1505,7 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             USE_TMA_STORE && false,
                             {enable_attn_logit_softcapping_flag},
                             {return_softmax_stats_flag},
+                            {enable_skip_softmax_flag},
                             {output_dtype_}>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1814,6 +1816,8 @@ def encode_name(kernel_spec):
         qkv_layout_tag = '_qkv'
     elif kernel_spec.input_layout == InputLayout.Q_PAGED_KV:
         qkv_layout_tag = '_q_paged_kv'
+    elif kernel_spec.input_layout == InputLayout.SEPARATE_Q_K_V:
+        qkv_layout_tag = '_q_k_v'
     else:
         qkv_layout_tag = '_q_kv'
     # for SM90 kernels, let's also differentiate ldgsts and tma kernels
@@ -1839,6 +1843,8 @@ def encode_name(kernel_spec):
 
     if kernel_spec.enable_attn_logit_softcapping:
         feature_tags += '_softcapping'
+    if kernel_spec.enable_skip_softmax:
+        feature_tags += '_skipSoftmax'
     if kernel_spec.sage_block_sizes:
         feature_tags += f"_sage_{'_'.join(map(str, kernel_spec.sage_block_sizes))}"
     if kernel_spec.output_dtype:
@@ -1907,8 +1913,9 @@ def enable_mutex(kspec):
 
 
 def enable_tma_store(kspec):
+    output_dtype = kspec.output_dtype if kspec.output_dtype is not None else kspec.dtype
     # TMA copies data in the 16B granularity.
-    return 'true' if (kspec.dtype in ['e4m3', 'e4m3_fp32']
+    return 'true' if (output_dtype in ['e4m3', 'e4m3_fp32']
                       and kspec.head_size % 16 == 0) else 'false'
 
 
@@ -1964,8 +1971,7 @@ def selected_mask_types(kspec):
             sliding_or_chunked_causal_mask = '0'
             custom_mask = '0'
         elif (kspec.head_size, kspec.head_size_v) == (192, 128):
-            # MLA context phase only needs causal mask now
-            padding_mask = '0'
+            # MLA context phase only needs causal mask and padding mask (for chunked prefill) now
             sliding_or_chunked_causal_mask = '0'
             custom_mask = '0'
         elif (kspec.head_size, kspec.head_size_v) == (576, 512):
@@ -1975,8 +1981,8 @@ def selected_mask_types(kspec):
             custom_mask = '0'
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
-            # NOTE: 72 is added for vision transformer
-            if kspec.head_size not in [32, 64, 72, 128]:
+            # NOTE: 72/80 are added for vision transformer
+            if kspec.head_size not in [32, 64, 72, 80, 128]:
                 padding_mask = '0'
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
@@ -2069,6 +2075,8 @@ def get_kernel_code(kspec, kname, lname):
             kernel_traits += '_paged_kv_cache'
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
             kernel_traits += '_contiguous_kv_cache'
+        elif kspec.input_layout == InputLayout.SEPARATE_Q_K_V:
+            kernel_traits += '_q_k_v'
 
     flags = 0
     if kspec.ldgsts_q:
@@ -2133,6 +2141,8 @@ def get_kernel_code(kspec, kname, lname):
 
     return_softmax_stats_flag = pythonBoolean2cpp[kspec.return_softmax_stats]
 
+    enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
+
     # needed by warpspec kernels.
     fp8_kernel = kspec.dtype in ["e4m3", "e4m3_fp32"]
     kernel_traits_header =  "fmha::ws::Kernel_traits_Hopper_qgmma_e4m3_fp32<" if fp8_kernel \
@@ -2161,7 +2171,8 @@ def get_kernel_code(kspec, kname, lname):
     params_str = 'reinterpret_cast<bert::Fused_multihead_attention_params_v2 &>(params)' if generate_cu_trtllm else 'params'
     attn_mask_type_str = 'using Attention_mask_type = ContextAttentionMaskType;' if generate_cu_trtllm else 'using Attention_mask_type = fmha::Attention_mask_type;'
     bert_launch_params = '' if generate_cu_trtllm else 'using Launch_params = bert::Fused_multihead_attention_launch_params;'
-    include_str = '#include "../fused_multihead_attention_common.h"' if generate_cu_trtllm else ''
+    include_str = '#include "../fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
+    include_str += '#include "tensorrt_llm/common/config.h"' if generate_cu_trtllm else ''
     num_compute_groups_str = '' if generate_cu_trtllm else 'static constexpr int NUM_COMPUTE_GROUPS = 2;'
     fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'{params_type}'
     const_fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'const {params_type}'
@@ -2187,8 +2198,19 @@ def get_kernel_code(kspec, kname, lname):
         const int COMPUTE_REG_COUNT = {compute_reg_count};
         asm volatile("{{setmaxnreg.inc.sync.aligned.u32 %0; \n\t}}" ::"n"(COMPUTE_REG_COUNT));'''.format(
         compute_reg_count=compute_reg_count)
-    local_ns_open = ns_open if generate_cu_trtllm else ''
-    local_ns_close = ns_close if generate_cu_trtllm else ''
+    abi_ns_open = r"""
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels
+{
+// clang-format off
+"""
+    abi_ns_close = r"""
+// clang-format on
+} // namespace kernels
+TRTLLM_NAMESPACE_END
+"""
+    local_ns_open = abi_ns_open if generate_cu_trtllm else ''
+    local_ns_close = abi_ns_close if generate_cu_trtllm else ''
 
     tmp = dict(locals(), **kspec._asdict())
 
@@ -2304,8 +2326,7 @@ def get_api_code(specs_names):
             # whether support alibi or not.
             if kspec.warp_specialization:
                 il_check += '&& params.has_alibi ' if kspec.alibi else '&& !params.has_alibi '
-                if kspec.input_layout.value == InputLayout.CONTIGUOUS_Q_KV:
-                    il_check += '&& params.softmax_stats_ptr != nullptr ' if kspec.return_softmax_stats else '&& params.softmax_stats_ptr == nullptr '
+                il_check += '&& params.softmax_stats_ptr != nullptr ' if kspec.return_softmax_stats else '&& params.softmax_stats_ptr == nullptr '
             # use enable_attn_logit_softcapping or not.
             il_check += '&& enable_attn_logit_softcapping ' if kspec.enable_attn_logit_softcapping else '&& !enable_attn_logit_softcapping '
             # check sage block sizes
@@ -2321,6 +2342,8 @@ def get_api_code(specs_names):
             il_check += f'&& sage_block_size_q == {sage_block_size_q} ' \
                 f'&& sage_block_size_k == {sage_block_size_k} ' \
                 f'&& sage_block_size_v == {sage_block_size_v} '
+
+            il_check += '&& enable_skip_softmax ' if kspec.enable_skip_softmax else '&& !enable_skip_softmax '
 
         il_check += '&& params.use_int8_scale_max ' if kspec.has_scale_max else '&& !params.use_int8_scale_max '
 
@@ -2598,6 +2621,7 @@ const bool warp_specialization               = launch_params.warp_specialization
 const bool use_tma                           = launch_params.use_tma;
 const bool use_flash_attention               = launch_params.flash_attention;
 const bool enable_attn_logit_softcapping     = launch_params.enable_attn_logit_softcapping;
+const bool enable_skip_softmax               = launch_params.enable_skip_softmax;
 const int  attention_input_layout            = static_cast<int>(launch_params.attention_input_layout);
 // tiled variant uses ldgsts
 const bool  use_tiled            = launch_params.use_granular_tiling;
@@ -2776,6 +2800,8 @@ def get_kernel_traits_code(specs_names):
         enable_attn_logit_softcapping_flag = pythonBoolean2cpp[
             kspec.enable_attn_logit_softcapping]
 
+        enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
+
         tmp = dict(locals(), **kspec._asdict())
 
         if effective_sm < 90:
@@ -2881,6 +2907,7 @@ def get_kernel_traits_code(specs_names):
                                   {loop_step},
                                   {kv_loop_step},
                                   {head_size},
+                                  {head_size_v},
                                   {q_tile_buffers},
                                   {kv_tile_buffers},
                                   NUM_COMPUTE_GROUPS,
@@ -2893,7 +2920,8 @@ def get_kernel_traits_code(specs_names):
                                   {input_layout_flag},
                                   __use_tma_store__ /* USE_TMA_STORE */,
                                   {enable_attn_logit_softcapping_flag},
-                                  {return_softmax_stats_flag}>;
+                                  {return_softmax_stats_flag},
+                                  {enable_skip_softmax_flag}>;
 
             printf("%s %d %d %s %d %d\\n",
                 \"{kname}\",
@@ -3049,14 +3077,35 @@ def get_kernel_traits_code(specs_names):
     return code
 
 
+# For now:
+# 1. Hopper head_size 128 kernel uses cubins for performance regressions.
+# 2. Hopper sm89 with e4m3/e4m3_fp32 dtype uses cubins for accuracy regressions (will be fixed).
+# 3. For skip-softmax attention feature, we force not to use cubins.
+# You should set the condition `use_cubin_header` to false if you have modified the source codes of those kernels that use cubins.
+# This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
+def use_cubin_header(sm,
+                     head_size,
+                     dtype,
+                     output_dtype=None,
+                     enable_skip_softmax=False):
+    if enable_skip_softmax:
+        return False
+    if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
+        return False
+    return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+
+
 def get_cubin_header(kernel_traits, specs_names):
     cubins = []
     cubin_lens = []
+    launchers = []
     cubins_dict = {}
     cubin_lens_dict = {}
+    launchers_dict = {}
     for kspec, fname, lname, kname in specs_names:
-        # only generate hopper sage cubin header
-        if generate_cu_trtllm and not ('sage' in kname and 'sm90' in kname):
+        if generate_cu_trtllm and not use_cubin_header(
+                kspec.sm, kspec.head_size, kspec.dtype, kspec.output_dtype,
+                kspec.enable_skip_softmax):
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3083,13 +3132,14 @@ def get_cubin_header(kernel_traits, specs_names):
                 'tma_',
                 '').replace('ldgsts_', '').replace('causal_', '').replace(
                     'alibi_', '').replace('softmax_', '').replace(
-                        'sliding_or_chunked_',
-                        '').replace('custom_mask_', '').replace(
-                            'qkv_', '').replace('q_kv_', '').replace(
-                                'q_paged_kv_', '').replace('ws_', '').replace(
-                                    'softcapping_',
-                                    '').replace('sage_',
-                                                '').replace('output_', ''))
+                        'sliding_or_chunked_', '').replace(
+                            'custom_mask_', '').replace('qkv_', '').replace(
+                                'q_kv_', '').replace('q_paged_kv_', '').replace(
+                                    'q_k_v_', '').replace('ws_', '').replace(
+                                        'softcapping_',
+                                        '').replace('sage_', '').replace(
+                                            'skipSoftmax_',
+                                            '').replace('output_', ''))
         flash_attention = 'flash_attention' in kname
         warp_specialization = 'tma_ws' in kname
         toks = tname.split('_')
@@ -3168,12 +3218,14 @@ def get_cubin_header(kernel_traits, specs_names):
         attention_mask_type_value = attention_mask_type.value
 
         # Attention input layout:
-        # packed_qkv (0), contiguous_q_kv (1), q_paged_kv (2).
+        # packed_qkv (0), contiguous_q_kv (1), q_paged_kv (2), separate_q_k_v (3).
         attention_input_layout = InputLayout.PACKED_QKV
         if '_q_kv' in kname:
             attention_input_layout = InputLayout.CONTIGUOUS_Q_KV
         elif '_q_paged_kv' in kname:
             attention_input_layout = InputLayout.Q_PAGED_KV
+        elif '_q_k_v' in kname:
+            attention_input_layout = InputLayout.SEPARATE_Q_K_V
 
         attention_input_layout_value = attention_input_layout.value
 
@@ -3183,6 +3235,8 @@ def get_cubin_header(kernel_traits, specs_names):
 
         return_softmax_stats_flag = pythonBoolean2cpp[sm != '90' or (
             sm == '90' and '_softmax' in kname)]
+
+        enable_skip_softmax_flag = pythonBoolean2cpp['_skipSoftmax' in kname]
 
         # meta_unroll_step
         meta_unroll_step = unroll_step if ('_nl' in kname
@@ -3209,11 +3263,13 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if 'sage' in kname and 'sm90' in kname:
+                    if use_cubin_header(int(sm), int(head_size), prec.lower(),
+                                        output_prec.lower(),
+                                        enable_skip_softmax_flag):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
-                        '_sliding_window_causal', '_custom_mask', '_causal'
+                        '_sliding_or_chunked_causal', '_custom_mask', '_causal'
                     ]
                     for mask_type in mask_types:
                         lname = lname.replace(mask_type, '')
@@ -3227,7 +3283,15 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
+'''.format(**locals()) if use_cubin_header(int(sm), int(head_size),
+                                           prec.lower(), output_prec.lower(),
+                                           enable_skip_softmax_flag) else '''\
+{{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
+{sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
+0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
+{attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
 '''.format(**locals())
             else:
                 code = '''\
@@ -3235,7 +3299,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}}}\
 '''.format(**locals())
             if sm in metadata_v2_dict:
                 metadata_v2_dict[sm].append(code)
@@ -3246,11 +3310,11 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm and lname != 'nullptr':
                 launcher = 'extern void {lname}(Fused_multihead_attention_params_v2& params, const Launch_params& launch_params, cudaStream_t stream);'.format(
                     lname=lname)
-                if int(sm) in cubins_dict:
-                    if launcher not in cubins_dict[int(sm)]:
-                        cubins_dict[int(sm)].append(launcher)
+                if int(sm) in launchers_dict:
+                    if launcher not in launchers_dict[int(sm)]:
+                        launchers_dict[int(sm)].append(launcher)
                 else:
-                    cubins_dict[int(sm)] = [launcher]
+                    launchers_dict[int(sm)] = [launcher]
         elif 'mhca' in kname:
             code = '''\
 {{ DATA_TYPE_{prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, kSM_{sm},  {cubin_name}, {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {is_il} }}\
@@ -3273,17 +3337,33 @@ def get_cubin_header(kernel_traits, specs_names):
     else:
         metadata_v2 = ',\n'.join(metadata_v2)
     # Add macros to only include needed cubins during compilation.
-    for sm in cubins_dict.keys():
+    # Collect all SM versions from all dictionaries
+    all_sms = sorted(
+        set(
+            list(cubins_dict.keys()) + list(cubin_lens_dict.keys()) +
+            list(launchers_dict.keys())))
+
+    for sm in all_sms:
         macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
         macro_end = f"#endif\n"
-        cubins.extend([macro_begin] + cubins_dict[sm] + [macro_end])
+
+        # Add cubin array declarations
+        if sm in cubins_dict:
+            cubins.extend([macro_begin] + cubins_dict[sm] + [macro_end])
+
+        # Add cubin length declarations
         if sm in cubin_lens_dict:
             cubin_lens.extend([macro_begin] + cubin_lens_dict[sm] + [macro_end])
+
+        # Add launcher declarations
+        if sm in launchers_dict:
+            launchers.extend([macro_begin] + launchers_dict[sm] + [macro_end])
 
     unroll_config_v1 = ',\n'.join(unroll_config_v1)
     unroll_config_v2 = ',\n'.join(unroll_config_v2)
     cubins = '\n'.join(cubins)
     cubin_lens = '\n'.join(cubin_lens)
+    launchers = '\n'.join(launchers)
     local_ns_open = ns_open
     local_ns_close = ns_close if generate_cu_trtllm else '}'
     launcher_line = '''
@@ -3327,7 +3407,8 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mAlibiSupported;
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
-    bool mReturnSoftmaxStats;{launcher_line}
+    bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;{launcher_line}
 }} sMhaKernelMetaInfosV2[] = {{
 {metadata_v2}
 }};
@@ -3388,6 +3469,7 @@ static const struct TestMetaV2
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
     bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;
 }} metaV2[] = {{
 {metadata_v2}
 }};
@@ -3395,7 +3477,210 @@ static const struct TestMetaV2
 
 '''.format(**locals(), copyright=copyright)
 
-    return code
+    # Generate header content (.h file)
+    if "GENERATE_CUBIN" in os.environ:
+        header_content = '''\
+{copyright}
+#pragma once
+
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels{{
+
+struct FusedMultiHeadAttentionKernelMetaInfoV2
+{{
+    Data_type mDataTypeIn;
+    Data_type mDataTypeOut;
+    unsigned int mS;
+    unsigned int mStepQ;
+    unsigned int mStepKV;
+    unsigned int mD;
+    unsigned int mDV;
+    unsigned int mSageBlockSizeQ;
+    unsigned int mSageBlockSizeK;
+    unsigned int mSageBlockSizeV;
+    unsigned int mSM;
+    const unsigned char* mCubin;
+    unsigned int mCubinSize;
+    const char* mFuncName;
+    unsigned int mSharedMemBytes;
+    unsigned int mThreadsPerCTA;
+    unsigned int mUnrollStep;
+    int mAttentionMaskType;
+    int mAttentionInputLayout;
+    bool mInterleaved;
+    bool mFlashAttention;
+    bool mWarpSpecialization;
+    bool mFP32Accumulation;
+    bool mAlibiSupported;
+    bool mTiled;
+    bool mEnableAttnLogitSoftcapping;
+    bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;{launcher_line}
+}};
+
+extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[];
+extern const int sMhaKernelMetaInfosV2Size;
+
+}} // namespace kernels
+TRTLLM_NAMESPACE_END
+'''.format(**locals(), copyright=copyright)
+        # Generate source content (.cpp file)
+        source_content = '''\
+{copyright}
+
+#include "tensorrt_llm/common/config.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime_api.h>
+
+{local_ns_open}
+
+//--- Cubin Arrays
+{cubins}
+
+//--- Cubin Lengths
+{cubin_lens}
+
+{local_ns_close}
+
+using namespace tensorrt_llm::kernels;
+
+namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {{
+
+class Fused_multihead_attention_params_v2;
+class Launch_params;
+
+//--- Kernel Launchers
+{launchers}
+
+// FIXME: These are duplicated declarations, we should remove them in the future.
+constexpr int32_t kSM_70 = 70;
+constexpr int32_t kSM_72 = 72;
+constexpr int32_t kSM_75 = 75;
+constexpr int32_t kSM_80 = 80;
+constexpr int32_t kSM_86 = 86;
+constexpr int32_t kSM_89 = 89;
+constexpr int32_t kSM_90 = 90;
+constexpr int32_t kSM_100 = 100;
+constexpr int32_t kSM_100f = 10100;
+constexpr int32_t kSM_103 = 103;
+constexpr int32_t kSM_120 = 120;
+constexpr int32_t kSM_121 = 121;
+
+// FIXME: These are duplicated declarations, we should remove them in the future.
+enum Data_type
+{{
+    DATA_TYPE_BOOL,
+    DATA_TYPE_FP16,
+    DATA_TYPE_FP32,
+    DATA_TYPE_INT4,
+    DATA_TYPE_INT8,
+    DATA_TYPE_INT32,
+    DATA_TYPE_BF16,
+    DATA_TYPE_E2M1,
+    DATA_TYPE_E4M3,
+    DATA_TYPE_E5M2
+}};
+
+struct FusedMultiHeadAttentionKernelMetaInfoV2
+{{
+    Data_type mDataTypeIn;
+    Data_type mDataTypeOut;
+    unsigned int mS;
+    unsigned int mStepQ;
+    unsigned int mStepKV;
+    unsigned int mD;
+    unsigned int mDV;
+    unsigned int mSageBlockSizeQ;
+    unsigned int mSageBlockSizeK;
+    unsigned int mSageBlockSizeV;
+    unsigned int mSM;
+    const unsigned char* mCubin;
+    unsigned int mCubinSize;
+    const char* mFuncName;
+    unsigned int mSharedMemBytes;
+    unsigned int mThreadsPerCTA;
+    unsigned int mUnrollStep;
+    int mAttentionMaskType;
+    int mAttentionInputLayout;
+    bool mInterleaved;
+    bool mFlashAttention;
+    bool mWarpSpecialization;
+    bool mFP32Accumulation;
+    bool mAlibiSupported;
+    bool mTiled;
+    bool mEnableAttnLogitSoftcapping;
+    bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;{launcher_line}
+}};
+
+extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {{
+{metadata_v2}
+}};
+
+extern const int sMhaKernelMetaInfosV2Size = sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]);
+}} // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
+'''.format(**locals(), copyright=copyright)
+    else:
+        # Non-GENERATE_CUBIN mode: use old behavior
+        header_content = code
+        source_content = None
+
+    return header_content, source_content
+
+
+# This is used to add some kernels running in cubins for passing CI cases.
+def modify_cubin_header(cubin_header):
+    result = cubin_header
+
+    # for CI cases
+    def add_kernel_line(result, target, addition):
+        pos = result.find(target)
+        if pos != -1:
+            end_pos = result.find('\n', pos)
+            if end_pos == -1:
+                end_pos = len(result)
+            result = result[:end_pos + 1] + addition + result[end_pos:]
+        return result
+
+    target = "#ifndef EXCLUDE_SM_80"
+    addition_cubin_array = """
+#ifndef EXCLUDE_SM_80
+extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
+#endif
+"""
+    addition_cubin_length = """
+#ifndef EXCLUDE_SM_80
+extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;
+#endif
+"""
+    # Add cubin array and length into there corresponding sections.
+    result = add_kernel_line(result, "//--- Cubin Arrays", addition_cubin_array)
+    result = add_kernel_line(result, "//--- Cubin Lengths",
+                             addition_cubin_length)
+
+    def modify_kernel_line(result, target, new_line):
+        lines = result.split('\n')
+        for i, line in enumerate(lines):
+            if target in line:
+                lines[i] = new_line
+                break
+        return '\n'.join(lines)
+
+    target = "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 64, 128, 128, 128, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled", 81920, 128, 64, 1, 2, false, true, false, false, true, true, false, true, false, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    # make sure only one empty line at the end
+    lines = result.split('\n')
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.append('')
+
+    return '\n'.join(lines)
 
 
 def generate_files(specs_names):
@@ -3438,7 +3723,6 @@ def generate_files(specs_names):
         f.write(print_kernel_traits_code)
 
     # Make sure we have a bin directory.
-    # TEMP disable this until sm90 is in a good shape [Timmy, do not MR.]
     if not os.path.exists('bin'):
         os.mkdir('bin')
     cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++17 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
@@ -3459,10 +3743,21 @@ def generate_files(specs_names):
     output = output.decode('utf-8').strip()
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output.splitlines()]
-    cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
+    # Use new function to generate both fmha_cubin.h and fmha_cubin.cpp files
+    # To switch back to old behavior, replace get_cubin_header_and_source with get_cubin_header
+    cubin_header, cubin_source = get_cubin_header(kernel_traits,
+                                                  valid_specs_names)
+    if generate_cu_trtllm:
+        cubin_source = modify_cubin_header(cubin_source)
 
+    # Write fmha_cubin.h file
     with open('./generated/fmha_cubin.h', 'w') as f:
         f.write(cubin_header)
+
+    # Write fmha_cubin.cpp file (same directory as fmha_cubin.h file)
+    if cubin_source is not None:
+        with open('./generated/fmha_cubin.cpp', 'w') as f:
+            f.write(cubin_source)
 
 
 def enumerate_hgmma_tma_kernels(specs, sm=90):
@@ -3540,117 +3835,171 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype='fp16'):
 
 
 # Note this will be used in TRT-LLM.
-def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
+def enumerate_hgmma_flash_warpspec_kernels(specs,
+                                           sm=90,
+                                           dtype='fp16',
+                                           enable_skip_softmax=False):
 
     scheduling_mode = int(os.getenv('SCHEDULING_MODE', '1'))
 
     # use specialized kernels for cases without alibi scales.
     # there is a numeric issues when applying the exp2f scale optimization and alibi scale at the same time.
     combinations = product([False, True], [False, True], \
-                           [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.Q_PAGED_KV], [False, True])
+                           [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
+                            InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V], [False, True])
     for (alibi, return_softmax, input_layout,
          enable_attn_logit_softcapping) in combinations:
         # alibi and enable_attn_logit_softcapping shouldn't be used together.
         if alibi and enable_attn_logit_softcapping:
             continue
-        if input_layout != InputLayout.CONTIGUOUS_Q_KV and return_softmax:
-            continue
-        # only specify
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[32, 40, 48, 64],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=256,
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=return_softmax,
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout))
+        # for normal attention, we only need contiguous kv as input layout when returning softmax.
+        skip_combination = return_softmax and input_layout != InputLayout.CONTIGUOUS_Q_KV
+        # for context mla, we need separate qkv as input layout when returning softmax.
+        skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
+        if not skip_combination:
+            # only specify
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[32, 40, 48, 64],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=256,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    enable_skip_softmax=enable_skip_softmax))
 
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[72, 80, 96, 104, 128],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=128,
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=return_softmax,
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout))
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[72, 80, 96, 104, 128],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=128,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    enable_skip_softmax=enable_skip_softmax))
 
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[160, 192, 256],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=64,
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=return_softmax,
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout))
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[160, 192, 256],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=64,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    enable_skip_softmax=enable_skip_softmax))
+        '''
+        smem size = (q_step * d * q_buffers * NUM_COMPUTE_GROUPS
+                    + (kv_step * d + kv_step * dv) * kv_buffers) * ele_size
+        Originally, head size is padded to next_power_of_2<d> and next_power_of_2<dv>.
+        For fp16/bf16 context MLA (d=192/dv=128), d is padded to 256, and dv remains 128,
+            if kv_step=64, then smem_size = 160 KB, it is OK but wastes much smem.
+            if kv_step=128, then smem_size = 256 KB, it is too big for Hopper (228KB smem per SM).
+        But in fact, 'next multiply of 128 bytes' is needed only, due to TMA 128B swizzle mode.
+        Then for fp16/bf16 context MLA, d remains 192 (192 * 2 = 128 * 3), and dv remains 128,
+            if kv_step = 128, then smem_size = 208 KB, smem is fully utilized.
+        '''
+        if not skip_mla_combination:
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=192,
+                    head_size_v=128,
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=128,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout))
 
 
 # Note this will be used in TRT-LLM.
@@ -3658,126 +4007,173 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                                            sm=90,
                                            dtype='e4m3',
                                            sage_block_sizes=None,
-                                           output_dtype=None):
+                                           output_dtype=None,
+                                           enable_skip_softmax=False):
 
     scheduling_mode = int(os.getenv('SCHEDULING_MODE', '1'))
 
     # use specialized kernels for cases without alibi scales.
     # there is a numeric issues when applying the exp2f scale optimization and alibi scale at the same time.
     combinations = product([False, True], \
-        [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.Q_PAGED_KV], [False, True])
-    for (alibi, input_layout, enable_attn_logit_softcapping) in combinations:
+        [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
+         InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V],
+        [False, True], [False, True])
+    for (alibi, input_layout, enable_attn_logit_softcapping,
+         return_softmax) in combinations:
         # alibi and bmm1_tanh_scale shouldn't be used together.
         if alibi and enable_attn_logit_softcapping:
             continue
-        # D <= 64: KV_STEP = 256
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[32, 40, 48, 64],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=256,
-                kv_tile_buffers=4,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=
-                False,  # return softmax stats is not supported for fp8 now
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout,
-                sage_block_sizes=sage_block_sizes,
-                output_dtype=output_dtype))
+        # for normal attention, we do not need return softmax for ws fp8 kernels currently.
+        # also fp8 input and bf16 output is only needed for MLA kernel.
+        skip_combination = return_softmax
+        # for context mla, we need separate qkv as input layout when returning softmax.
+        skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
+        if not skip_combination:
+            # D <= 64: KV_STEP = 256
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[32, 40, 48, 64],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=256,
+                    kv_tile_buffers=4,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype,
+                    enable_skip_softmax=enable_skip_softmax))
 
-        # 64 < D <=128: KV_STEP = 128
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[80, 96, 104, 128],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=256,
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=
-                False,  # return softmax stats is not supported for fp8 now
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout,
-                sage_block_sizes=sage_block_sizes,
-                output_dtype=output_dtype))
+            # 64 < D <=128: KV_STEP = 128
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[80, 96, 104, 128],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=256,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype,
+                    enable_skip_softmax=enable_skip_softmax))
 
-        # 128 < D <=256: KV_STEP = 128
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=[160, 192, 256],
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=
-                128,  # use 64 kv step size to avoid register spilling
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=
-                False,  # return softmax stats is not supported for fp8 now
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout,
-                sage_block_sizes=sage_block_sizes,
-                output_dtype=output_dtype))
+            # 128 < D <=256: KV_STEP = 128
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=[160, 192, 256],
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=
+                    128,  # use 128 kv step size to avoid register spilling
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype,
+                    enable_skip_softmax=enable_skip_softmax))
+
+        if not skip_mla_combination:
+            # context MLA (192x128)
+            specs.append(
+                kernel_spec(
+                    sm=sm,
+                    sm_mma=90,
+                    dtype=dtype,
+                    seq_len=0,  # support any sequence length
+                    head_size=192,
+                    head_size_v=128,
+                    warps_m=4,  #4x1 warpgroups
+                    warps_n=1,
+                    version=2,
+                    interleaved=False,
+                    ldgsts_q=
+                    False,  # for Hopper kernels, ldgsts = False signals TMA usage.
+                    ldgsts_k=False,
+                    ldgsts_v=False,
+                    share_smem_k_v=False,
+                    loop_step=64,
+                    q_tile_buffers=1,  # only used by warp specialized kernels
+                    has_noloop=0,
+                    noloop_step=64,
+                    kv_loop_step=128,
+                    kv_tile_buffers=2,  # only used by warp specialized kernels
+                    unroll_threshold=1,
+                    has_scale_max=False,
+                    flash_attention=True,
+                    warp_specialization=True,
+                    alibi=alibi,
+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                    return_softmax_stats=return_softmax,
+                    scheduling_mode=scheduling_mode,
+                    input_layout=input_layout,
+                    sage_block_sizes=sage_block_sizes,
+                    output_dtype=output_dtype))
 
 
 def enumerate_igmma_kernels(specs, sm=90):
@@ -4554,9 +4950,16 @@ def enumerate_hmma_paged_kv_flash_kernels(specs, sm=80, dtype='fp16'):
 
 
 def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
-    for (input_layout, enable_attn_logit_softcapping) in \
-        product([InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.Q_PAGED_KV], \
-                [False, True]):
+    input_layouts = [
+        InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
+        InputLayout.Q_PAGED_KV
+    ]
+    # Deepseek MLA (context 192/128 separate-q-k-v)
+    if head_size_v == 128:
+        input_layouts.append(InputLayout.SEPARATE_Q_K_V)
+    for (input_layout,
+         enable_attn_logit_softcapping) in product(input_layouts,
+                                                   [False, True]):
         enumerate_hmma_flash_kernels_base(specs, sm, dtype, input_layout,
                                           enable_attn_logit_softcapping,
                                           head_size_v)
@@ -4932,7 +5335,7 @@ def enumerate_qmma_flash_kernels(specs,
     ]
     input_layouts = [
         InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
-        InputLayout.Q_PAGED_KV
+        InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V
     ]
     for (head_size_params, (q_loop_step, kv_loop_step), tiled), input_layout in \
             product(params_q_kv_step, input_layouts):
@@ -4945,6 +5348,9 @@ def enumerate_qmma_flash_kernels(specs,
             head_size_v = 0
         # skip if head_size is not in head_sizes
         if head_sizes is not None and head_size not in head_sizes:
+            continue
+        # skip if head_size_v is not 128 for separate-q-k-v
+        if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v != 128:
             continue
         specs.append(
             kernel_spec(sm=sm,
@@ -6012,9 +6418,21 @@ def enumerate_kernels():
     enumerate_igmma_kernels(specs, sm=90)
     enumerate_qgmma_kernels(specs, sm=90)
     # need to add bf16 kernels if needed
-    enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16')
-    enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='bf16')
-    enumerate_qgmma_flash_warpspec_kernels(specs, sm=90, dtype='e4m3')
+    for enable_skip_softmax in [False, True]:
+        if enable_skip_softmax and 'DISABLE_SKIP_SOFTMAX' in os.environ:
+            continue
+        enumerate_hgmma_flash_warpspec_kernels(
+            specs, sm=90, dtype='fp16', enable_skip_softmax=enable_skip_softmax)
+        enumerate_hgmma_flash_warpspec_kernels(
+            specs, sm=90, dtype='bf16', enable_skip_softmax=enable_skip_softmax)
+        enumerate_qgmma_flash_warpspec_kernels(
+            specs, sm=90, dtype='e4m3', enable_skip_softmax=enable_skip_softmax)
+        enumerate_qgmma_flash_warpspec_kernels(
+            specs,
+            sm=90,
+            dtype='e4m3',
+            output_dtype="bf16",
+            enable_skip_softmax=enable_skip_softmax)
 
     # For now SageAttention only needs BF16
     # block_size_q should be divisible by 64
@@ -6198,6 +6616,7 @@ def enumerate_kernels():
                   and kspec.version       == 2
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
+                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
                   or (kspec.sm == 90
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32']
                   and kspec.head_size     <= 256
@@ -6205,17 +6624,51 @@ def enumerate_kernels():
                   and kspec.version       == 2
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == False)
-                  # Deepseek MLA (192/128 packed + 576/512 paged)
-                  or (kspec.sm            in [80, 86, 89, 90, 100, 120]
+                  # Clip/SigLip support.
+                  or  (kspec.sm           == 100
+                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
+                  and kspec.head_size     == 80
+                  and kspec.head_size_v   == 0
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == True
+                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
+                  # Gemma3 VL support.
+                  or  (kspec.sm           == 100
+                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
+                  and kspec.head_size     == 72
+                  and kspec.head_size_v   == 0
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == True
+                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
+                  # Deepseek MLA (generation 576/512 paged)
+                  or (kspec.sm            in [90, 100, 120]
                   and kspec.dtype         in ['bf16', 'e4m3_fp32']
-                  and (((kspec.head_size, kspec.head_size_v) == (192, 128) and kspec.input_layout in [InputLayout.PACKED_QKV, InputLayout.Q_PAGED_KV])
-                    or ((kspec.head_size, kspec.head_size_v) == (576, 512) and kspec.input_layout == InputLayout.Q_PAGED_KV))
+                  and kspec.head_size     == 576
+                  and kspec.head_size_v   == 512
+                  and kspec.input_layout == InputLayout.Q_PAGED_KV
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.warp_specialization == False
                   and kspec.tiled == True)
+                  # Deepseek MLA (context 192/128 separate-q-k-v)
+                  or (kspec.sm            in [90, 100, 120]
+                  and kspec.dtype         in ['bf16', 'e4m3', 'e4m3_fp32']
+                  and kspec.head_size     == 192
+                  and kspec.head_size_v   == 128
+                  and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == True
+                  and ((kspec.warp_specialization == True and kspec.alibi == False)   # sm90
+                    or (kspec.warp_specialization == False and kspec.tiled == True))  # non-sm90
+                  and kspec.enable_attn_logit_softcapping == False)
                   # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
                   or (kspec.sm            == 90
                   and kspec.head_size     in [80, 128]

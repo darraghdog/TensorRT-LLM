@@ -148,7 +148,7 @@ WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(
 
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
 }
@@ -394,13 +394,13 @@ void pre_quant_scale_for_act(int const m, int const k, int const mQuantAlgo, int
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, __nv_fp8_e4m3>(
             reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
-            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, nullptr, stream);
     }
     else
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, ActType>(
             reinterpret_cast<ActType*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
-            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, nullptr, stream);
     }
 }
 

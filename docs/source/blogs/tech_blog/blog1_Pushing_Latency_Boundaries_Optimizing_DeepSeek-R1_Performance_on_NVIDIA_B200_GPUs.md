@@ -1,43 +1,45 @@
 # Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs
-by NVIDIA TensorRT-LLM team
+by NVIDIA TensorRT LLM team
 ## Table of Contents
 
-- [Background](#background)
-- [Implementation Configuration](#implementation-configuration)
-  - [Workload Profile](#workload-profile)
-  - [Model Architecture](#model-architecture)
-  - [Precision Strategy](#precision-strategy)
-  - [Parallelism Strategy](#parallelism-strategy)
-  - [Everything in One Diagram](#everything-in-one-diagram)
-- [Key Optimizations](#key-optimizations)
-  - [System Level optimizations](#system-level-optimizations)
-    - [CUDA Graph & Programmatic Dependent Launch](#cuda-graph--programmatic-dependent-launch)
-    - [MTP](#mtp)
-      - [Autoregressive MTP Layers](#autoregressive-mtp-layers)
-      - [Relax Acceptance Verification](#relax-acceptance-verification)
-    - [Multi-streams](#multi-streams)
-    - [Sparse Experts as GEMMs](#sparse-experts-as-gemms-only-works-when-moe_backendcutlass)
-    - [Re-balanced the sparse experts](#re-balanced-the-sparse-experts)
-      - [Mixed ETP](#mixed-etp)
-      - [Smart Router](#smart-router)
-  - [Kernel Level optimizations](#kernel-level-optimizations)
-    - [Attention Kernel](#attention-kernel)
-    - [Grouped GEMM](#grouped-gemm)
-      - [CUTLASS Backend](#cutlass-backend-default-backend)
-      - [TRTLLM Backend](#trtllm-backend)
-    - [Communication Kernel](#communication-kernel)
-    - [Dense GEMM optimization](#dense-gemm-optimization)
-      - [Fuse_A_GEMM](#fuse_a_gemm)
-      - [RouterGEMM](#routergemm)
-    - [Kernel fusion](#kernel-fusion)
-- [How to reproduce](#how-to-reproduce)
-- [Future Works](#future-works)
-- [Acknowledgment](#acknowledgment)
+- [Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs](#pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus)
+  - [Table of Contents](#table-of-contents)
+  - [Background](#background)
+  - [Implementation Configuration](#implementation-configuration)
+    - [Workload Profile](#workload-profile)
+    - [Model Architecture](#model-architecture)
+    - [Precision Strategy](#precision-strategy)
+    - [Parallelism Strategy](#parallelism-strategy)
+    - [Everything in One Diagram](#everything-in-one-diagram)
+  - [Key Optimizations](#key-optimizations)
+    - [System Level optimizations](#system-level-optimizations)
+      - [CUDA Graph \& Programmatic Dependent Launch](#cuda-graph--programmatic-dependent-launch)
+      - [MTP](#mtp)
+        - [Autoregressive MTP Layers](#autoregressive-mtp-layers)
+        - [Relax Acceptance Verification](#relax-acceptance-verification)
+      - [Multi-streams](#multi-streams)
+      - [Sparse Experts as GEMMs (only works when moe\_backend=CUTLASS)](#sparse-experts-as-gemms-only-works-when-moe_backendcutlass)
+      - [Re-balanced the sparse experts](#re-balanced-the-sparse-experts)
+        - [Mixed ETP](#mixed-etp)
+        - [Smart Router](#smart-router)
+    - [Kernel Level optimizations](#kernel-level-optimizations)
+      - [Attention Kernel](#attention-kernel)
+      - [Grouped GEMM](#grouped-gemm)
+        - [CUTLASS Backend (default backend)](#cutlass-backend-default-backend)
+        - [TRTLLM Backend](#trtllm-backend)
+      - [Communication Kernel](#communication-kernel)
+      - [Dense GEMM optimization](#dense-gemm-optimization)
+        - [Fuse\_A\_GEMM](#fuse_a_gemm)
+        - [RouterGEMM](#routergemm)
+      - [Kernel fusion](#kernel-fusion)
+  - [How to reproduce](#how-to-reproduce)
+  - [Future Works](#future-works)
+  - [Acknowledgment](#acknowledgment)
 
 ## Background
 Recent advancements in Large Language Reasoning Models have demonstrated remarkable success, while creating new deployment challenges. A critical challenge emerges from extended Output Sequence Lengths (OSL) due to complex "thinking and reasoning" processes. Longer OSL demands stricter Token-to-Token Latency (TTL) requirements, often forcing concurrency limitations. The most extreme case, single concurrency (min-latency scenario) , becomes particularly challenging for real-time applications.
 
-This article explores how TensorRT-LLM achieves record-breaking performance for [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) in min-latency scenarios on NVIDIA's 8×B200 GPU configuration progressing from 67 tokens per second (TPS) to 253 before GTC 2025(**3.7x** speed-up), and to our current number is 368 TPS (**5.5x** speed-up).
+This article explores how TensorRT LLM achieves record-breaking performance for [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) in min-latency scenarios on NVIDIA's 8×B200 GPU configuration progressing from 67 tokens per second (TPS) to 253 before GTC 2025(**3.7x** speed-up), and to our current number is 368 TPS (**5.5x** speed-up).
 
 
 ## Implementation Configuration
@@ -63,9 +65,9 @@ We have explored a mixed precision recipe, which provides a better tradeoff betw
 |  3x MTP Layers                        |   bf16    |
 |  RouterGEMM***                        |   bf16    |
 
-*TensorRT-LLM already supports [FP8 Attention](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#fp8-kv-cache-and-mla) while for this latency scenario low-precision attention computation doesn't help with performance so we choose to use bf16 precision for the Attention Modules.
+*TensorRT LLM already supports [FP8 Attention](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/deepseek_v3#fp8-kv-cache-and-mla) while for this latency scenario low-precision attention computation doesn't help with performance so we choose to use bf16 precision for the Attention Modules.
 
-** nvfp4 model checkpoint is generated by the [NVIDIA TensorRT Model Optimizer toolkit](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+** nvfp4 model checkpoint is generated by the [NVIDIA Model Optimizer toolkit](https://github.com/NVIDIA/Model-Optimizer).
 
 *** RouterGEMM uses bf16 inputs/weights with fp32 outputs for numerical stability
 
@@ -123,7 +125,7 @@ The modules in the diagram are:
 | Baseline: CUDA Graph + EP8TP8                             |   67     | [modeling_deepseekv3.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py)                                |
 | Multi Stream to overlap shared expert with sparse experts |   73     | [modeling_deepseekv3.py#L506](https://github.com/NVIDIA/TensorRT-LLM/blob/14bfb5e0d6e81aec3306a1324cf074566646f886/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L506) |
 | Optimize MLA Kernel                                       |   80     | [PR #3763](https://github.com/NVIDIA/TensorRT-LLM/pull/3763)                                                                                                |
-| Optimize TopK Kernels                                     |   84     | • [RoutingKernel.cu](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/trtllmGenSrc/RoutingKernel.cu)<br/>• [noAuxTcKernels.cu](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/noAuxTcKernels.cu) |
+| Optimize TopK Kernels                                     |   84     | • [RoutingKernelTopK.cuh](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingKernelTopK.cuh)<br/>• [noAuxTcKernels.cu](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/noAuxTcKernels.cu) |
 | Optimize Fuse_A_GEMM                                      |   89     | [attention.py#L345](https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/tensorrt_llm/_torch/modules/attention.py#L345)     |
 | MTP3_Vanilla                                              |   154    | evolve to MTP3_Autoregressive                                                                                                                                                           |
 | Evolve to MTP3_Autoregressive + Optimize Router GEMM      |   164    | [modeling_deepseekv3.py#L304](https://github.com/NVIDIA/TensorRT-LLM/blob/d6b741ddfe7f8a80718c10d49773c42abc0a254f/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L304) |
@@ -261,6 +263,6 @@ It's also needed to set `use_relaxed_acceptance_for_thinking: true`, `relaxed_to
 - More Exploration of MTP
 
 ## Acknowledgment
-Pushing the performance boundaries of DeepSeek R1 for latency-sensitive applications has been a remarkable engineering journey. The optimizations detailed in this post represent an exceptional cross-functional collaboration across the entire AI technology stack - spanning kernel-level optimizations, runtime enhancements, model quantization techniques, algorithmic improvements, and systematic performance analysis and tuning. While we can't individually acknowledge every contributor, we're proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in TensorRT-LLM performance engineering.
+Pushing the performance boundaries of DeepSeek R1 for latency-sensitive applications has been a remarkable engineering journey. The optimizations detailed in this post represent an exceptional cross-functional collaboration across the entire AI technology stack - spanning kernel-level optimizations, runtime enhancements, model quantization techniques, algorithmic improvements, and systematic performance analysis and tuning. While we can't individually acknowledge every contributor, we're proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in TensorRT LLM performance engineering.
 
 Through this collaborative endeavor, we've developed valuable insights into maximizing GPU utilization for large language model inference. We hope that the techniques and best practices shared in this blog will empower the developer community to better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.

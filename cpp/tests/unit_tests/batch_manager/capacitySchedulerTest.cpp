@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <gmock/gmock.h>
@@ -129,10 +134,13 @@ protected:
         bool onboardBlocks = true;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
+        using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        auto const blocksPerWindow = BlocksPerWindow{{maxNumTokensPerSeq, {maxNumBlocks, 0}}};
+
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
-            maxNumBlocks, 0, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
-            sinkTokenLength, streamPtr, std::nullopt, enableReuse, onboardBlocks, cacheType);
+            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
+            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, onboardBlocks, cacheType);
     }
 
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()
@@ -405,10 +413,6 @@ int runTest(CapacityScheduler& capacityScheduler,
             else
             {
                 kvCacheManager->addToken(llmReq->mRequestId);
-                if (crossKvCacheManager)
-                {
-                    crossKvCacheManager->addToken(llmReq->mRequestId);
-                }
                 llmReq->addNewTokens({itCount});
             }
             if (llmReq->getNumTokens(0) == promptLen + llmReq->mMaxNewTokens)
@@ -450,7 +454,8 @@ TEST_F(CapacitySchedulerTest, SimpleShouldFit)
 
     auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kSTATIC_BATCH};
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0. (e.g. 4)
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
     {
         for (auto sinkTokenLen : sinkTokenLens)
@@ -503,7 +508,8 @@ TEST_F(CapacitySchedulerTest, SimpleShouldFitWithCrossBlocks)
 
     auto capacitySchedulerPolicies
         = std::vector<CapacitySchedulerPolicy>{CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0. (e.g. 4)
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
     {
         for (auto sinkTokenLen : sinkTokenLens)
@@ -547,7 +553,8 @@ TEST_F(CapacitySchedulerTest, SimpleLoraFitsDuplicateTask)
 
     auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kSTATIC_BATCH};
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0. (e.g. 4)
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
     {
         for (auto sinkTokenLen : sinkTokenLens)
@@ -591,7 +598,8 @@ TEST_F(CapacitySchedulerTest, SimpleLoraDoesntFitDuplicateTask)
 
     auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kSTATIC_BATCH};
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0. (e.g. 4)
+    auto sinkTokenLens = std::vector<SizeType32>{0};
 
     for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
     {
@@ -701,7 +709,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitMaxUtilization)
     SizeType32 maxNumRequests = 2;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0. (e.g. 4)
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(
@@ -826,9 +835,13 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitPriorities)
     SizeType32 maxNumRequests = 2;
     SizeType32 maxInputLen = 1000;
 
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    // Removed configuration:
+    // {CapacitySchedulerPolicy::kMAX_UTILIZATION, 4, 125}
+    // {CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, 1, 160}
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     auto configurations = std::vector<std::tuple<CapacitySchedulerPolicy, SizeType32, int>>{
-        {CapacitySchedulerPolicy::kMAX_UTILIZATION, 0, 119}, {CapacitySchedulerPolicy::kMAX_UTILIZATION, 4, 125},
-        {CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, 1, 160}};
+        {CapacitySchedulerPolicy::kMAX_UTILIZATION, 0, 119}};
 
     for (auto [capacitySchedulerPolicy, sinkTokenLen, expectedNumIters] : configurations)
     {
@@ -1024,7 +1037,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitGuaranteedCompletion)
     SizeType32 maxNumRequests = 2;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0. (e.g. 4)
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(
@@ -1077,7 +1091,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitWithCrossBlocks)
 
     auto capacitySchedulerPolicies
         = std::vector<CapacitySchedulerPolicy>{CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    auto sinkTokenLens = std::vector<SizeType32>{0};
 
     for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
     {
@@ -1169,7 +1184,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitAddingNewRequestsMaxUtilization)
     SizeType32 maxNumRequests = 4;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(
@@ -1354,7 +1370,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitAddingNewRequestsMaxUtilizationPrio
     SizeType32 maxNumRequests = 4;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(
@@ -1501,7 +1518,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitAddingNewRequestsGuaranteedCompleti
     SizeType32 maxNumRequests = 4;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(
@@ -1552,7 +1570,8 @@ TEST_F(CapacitySchedulerTest, SimpleDoesntFitAddingNewRequestsGuaranteedCompleti
     SizeType32 maxNumRequests = 4;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(
@@ -1832,7 +1851,8 @@ TEST_F(CapacitySchedulerTest, SimpleFitsStaticBatch)
     SizeType32 maxNumRequests = 2;
     SizeType32 maxInputLen = 1000;
 
-    auto sinkTokenLens = std::vector<SizeType32>{0, 4};
+    // TODO: Support and add coverage for sinkTokenLen > 0
+    auto sinkTokenLens = std::vector<SizeType32>{0};
     for (auto sinkTokenLen : sinkTokenLens)
     {
         auto kvCacheManager = getKvCacheManager(

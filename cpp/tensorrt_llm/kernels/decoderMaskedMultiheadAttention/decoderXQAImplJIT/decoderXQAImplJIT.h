@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 
 #include "compileEngine.h"
@@ -23,10 +24,12 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <unordered_set>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
+
+class DecoderXQARunnerResource;
 
 class DecoderXQAImplJIT : public DecoderXQAImpl
 {
@@ -46,6 +49,10 @@ protected:
 
 private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
+    std::shared_ptr<DecoderXQARunnerResource> mResource;
+
+    //! Whether DecoderXQAImplJIT needs to compile 2 sets (tilesize = 16, 32) kernels for spec-dec
+    bool needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const;
 
     //! Whether DecoderXQAImplJIT supports xqaParams.
     bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
@@ -69,4 +76,5 @@ private:
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

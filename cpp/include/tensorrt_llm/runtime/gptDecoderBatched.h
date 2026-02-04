@@ -47,16 +47,14 @@ public:
 
     explicit GptDecoderBatched(CudaStreamPtr stream);
 
-    void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-        SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig) override;
+    void setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig) override;
 
     void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 
-    CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Output& output,
-        decoder_batch::Input const& input) override;
-    void forward(decoder::DecoderState const& decoderState, decoder_batch::Output& output,
-        decoder_batch::Input const& input) override;
+    CudaEvent forwardAsync(
+        decoder::DecoderState const& decoderState, batch_manager::DecoderInputBuffers const& input) override;
+    void forward(decoder::DecoderState const& decoderState, batch_manager::DecoderInputBuffers const& input) override;
 
     //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
@@ -80,8 +78,7 @@ public:
 
 private:
     //! @brief Calls decoders for tokens per engine step
-    void forwardDispatch(
-        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input);
+    void forwardDispatch(decoder::DecoderState const& decoderState, batch_manager::DecoderInputBuffers const& input);
 
 private:
     CudaStreamPtr mRuntimeStream;

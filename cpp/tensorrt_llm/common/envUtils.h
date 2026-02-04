@@ -16,16 +16,25 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 // Useful when you want to inject some debug code controllable with env var.
 std::optional<int32_t> getIntEnv(char const* name);
 
 std::optional<size_t> getUInt64Env(char const* name);
+
+std::optional<float> getFloatEnv(char const* name);
+
+bool getBoolEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
@@ -51,12 +60,43 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
+    cudaStream_t stream, Args&&... args)
+{
+    TLLM_LOG_DEBUG("Enable PDL in %s", name);
+    cudaLaunchConfig_t kernelConfig;
+    kernelConfig.gridDim = grid;
+    kernelConfig.blockDim = block;
+    kernelConfig.dynamicSmemBytes = dynamicShmSize;
+    kernelConfig.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    kernelConfig.attrs = attrs;
+    kernelConfig.numAttrs = 1;
+
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...));
+}
+
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
 
+bool getEnvUseMooncakeKvCache();
+
+bool getEnvUseRoundRobinBlockDistForCP();
+
 std::string getEnvUCXInterface();
+
+std::string getEnvNixlInterface();
+
+std::string getEnvNixlBackend();
+
+std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
 
@@ -68,7 +108,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -77,6 +117,9 @@ bool getEnvForceDeterministic();
 
 // Force deterministic behavior for MoE plugin.
 bool getEnvForceDeterministicMOE();
+
+// Disable finalize fusion in MoE plugin
+bool getEnvMOEDisableFinalizeFusion();
 
 // Force deterministic behavior for attention plugin.
 bool getEnvForceDeterministicAttention();
@@ -102,4 +145,24 @@ uint16_t getEnvNixlPort();
 
 bool getEnvDisaggBenchmarkGenOnly();
 
-} // namespace tensorrt_llm::common
+// Whether to disable the chunked-attention in the generation phase.
+bool getEnvDisableChunkedAttentionInGenPhase();
+
+// Whether to use one block per token for MoE A2A kernels (default true).
+bool getEnvMoeA2AOneBlockPerToken();
+
+// TODO: For DEV purpose temporarily.
+// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
+int getEnvMoeA2ADispatchBlockSize();
+// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
+int getEnvMoeA2ACombineBlockSize();
+
+bool getEnvKVCacheTransferAllBlocksForWindow();
+
+bool getEnvEplbForceGdrcopy();
+
+bool getEnvPrintSkipSoftmaxStat();
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

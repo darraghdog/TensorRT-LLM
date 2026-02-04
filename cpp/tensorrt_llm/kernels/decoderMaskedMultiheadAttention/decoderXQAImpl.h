@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <memory>
 
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -79,8 +80,10 @@ protected:
 enum class XQAKernelType : int32_t
 {
     kAMPERE_WARP_SPECIALIZED = 0,
-    kHOPPER_WARP_SPECIALIZED = 1
+    kHOPPER_WARP_SPECIALIZED = 1,
+    kSM120_MLA = 2
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

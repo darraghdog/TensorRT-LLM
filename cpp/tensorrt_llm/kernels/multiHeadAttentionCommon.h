@@ -17,11 +17,12 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include <limits.h>
 #include <stdint.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -111,7 +112,10 @@ constexpr int32_t kSM_86 = 86;
 constexpr int32_t kSM_89 = 89;
 constexpr int32_t kSM_90 = 90;
 constexpr int32_t kSM_100 = 100;
+constexpr int32_t kSM_100f = 10100;
+constexpr int32_t kSM_103 = 103;
 constexpr int32_t kSM_120 = 120;
+constexpr int32_t kSM_121 = 121;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -119,4 +123,5 @@ static constexpr int kIdxScaleSoftmaxPtr = 0;
 static constexpr int kIdxScaleSoftmaxLog2Ptr = 1;
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

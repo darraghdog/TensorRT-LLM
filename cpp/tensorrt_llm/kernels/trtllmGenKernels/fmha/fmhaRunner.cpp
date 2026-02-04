@@ -15,14 +15,15 @@
  */
 
 #include "fmhaRunner.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,10 +35,11 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_t
     , mDtypeKv(dtypeKv)
     , mDtypeOut(dtypeOut)
 {
-    TLLM_CHECK_WITH_INFO(mSM == kSM_100, "Unsupported architecture");
+    TLLM_CHECK_WITH_INFO(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(
         mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16, "Unsupported Q data type");
-    TLLM_CHECK_WITH_INFO(mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
+    TLLM_CHECK_WITH_INFO(mDtypeKv == DATA_TYPE_E2M1 || mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16
+            || mDtypeKv == DATA_TYPE_BF16,
         "Unsupported Kv data type");
     TLLM_CHECK_WITH_INFO(mDtypeOut == DATA_TYPE_E2M1 || mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16
             || mDtypeOut == DATA_TYPE_BF16,
@@ -75,4 +77,5 @@ size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

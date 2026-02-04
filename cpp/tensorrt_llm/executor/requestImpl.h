@@ -32,15 +32,14 @@ class Request::Impl
 {
 
 public:
-    // 35 parameters, 35 items in initialization list
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig,
-        std::optional<PromptTuningConfig> pTuningConfig, std::optional<Tensor> multimodalEmbedding,
-        std::optional<MropeConfig> mRopeConfig, std::optional<LoraConfig> loraConfig,
-        std::optional<LookaheadDecodingConfig> lookaheadConfig,
+        std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
+        std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
+        std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
         std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitsPostProcessor,
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
@@ -48,7 +47,8 @@ public:
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
-        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs)
+        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
+        std::optional<CacheSaltIDType> cacheSaltID, std::optional<IdType> disaggRequestId)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -62,6 +62,7 @@ public:
         , mEmbeddingBias(checkEmbeddingBias(std::move(embeddingBias)))
         , mExternalDraftTokensConfig(std::move(externalDraftTokensConfig))
         , mPTuningConfig(std::move(pTuningConfig))
+        , mMultimodalInput(std::move(multimodalInput))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeConfig(std::move(mRopeConfig))
         , mLoraConfig(std::move(loraConfig))
@@ -84,6 +85,8 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
+        , mCacheSaltID(cacheSaltID)
+        , mDisaggRequestId(disaggRequestId)
     {
         validate();
     }
@@ -180,6 +183,11 @@ public:
     [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const
     {
         return mMultimodalEmbedding;
+    }
+
+    [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const
+    {
+        return mMultimodalInput;
     }
 
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const
@@ -290,6 +298,16 @@ public:
         return mLanguageAdapterUid;
     }
 
+    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const
+    {
+        return mCacheSaltID;
+    }
+
+    [[nodiscard]] std::optional<IdType> getDisaggRequestId() const
+    {
+        return mDisaggRequestId;
+    }
+
     void setStreaming(bool streaming)
     {
         mStreaming = streaming;
@@ -348,6 +366,11 @@ public:
     void setMultimodalEmbedding(Tensor const& multimodalEmbedding)
     {
         mMultimodalEmbedding = multimodalEmbedding;
+    }
+
+    void setMultimodalInput(MultimodalInput const& multimodalInput)
+    {
+        mMultimodalInput = multimodalInput;
     }
 
     void setMropeConfig(MropeConfig const& mRopeConfig)
@@ -459,6 +482,16 @@ public:
         mLanguageAdapterUid = languageAdapterUid;
     }
 
+    void setCacheSaltID(CacheSaltIDType cacheSaltID)
+    {
+        mCacheSaltID = cacheSaltID;
+    }
+
+    void setDisaggRequestId(IdType disaggRequestId)
+    {
+        mDisaggRequestId = disaggRequestId;
+    }
+
 private:
     void validate()
     {
@@ -510,6 +543,7 @@ private:
         lambda(mEmbeddingBias);
         lambda(mExternalDraftTokensConfig);
         lambda(mPTuningConfig);
+        lambda(mMultimodalInput);
         lambda(mMultimodalEmbedding);
         lambda(mMropeConfig);
         lambda(mLoraConfig);
@@ -531,6 +565,8 @@ private:
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
+        lambda(mCacheSaltID);
+        lambda(mDisaggRequestId);
     }
 
     VecTokens mInputTokenIds;
@@ -546,6 +582,7 @@ private:
     std::optional<Tensor> mEmbeddingBias;
     std::optional<ExternalDraftTokensConfig> mExternalDraftTokensConfig;
     std::optional<PromptTuningConfig> mPTuningConfig;
+    std::optional<MultimodalInput> mMultimodalInput;
     std::optional<Tensor> mMultimodalEmbedding;
     std::optional<MropeConfig> mMropeConfig;
     std::optional<LoraConfig> mLoraConfig;
@@ -568,6 +605,8 @@ private:
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
+    std::optional<CacheSaltIDType> mCacheSaltID;
+    std::optional<IdType> mDisaggRequestId;
 };
 
 } // namespace tensorrt_llm::executor

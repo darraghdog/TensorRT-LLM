@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <tuple>
 
 #include "tensorrt_llm/common/logger.h"
@@ -25,7 +26,9 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 template <typename _Param, typename _InputType, typename _OutputType, typename _AccumulatorType, bool _RMS_NORM,
     int _M_BLOCK, int _N_BLOCK, int _STAGES = 3, bool _PERSISTENT_MODE = true, bool _LOW_LATENCY_MODE = false>
@@ -137,23 +140,25 @@ void invokeWSLayerNormImpl(
 
         if (M_BLOCK == 1 && waves == 1)
         {
-            _invokeSelectRMSNorm(Int<1>{}, n_block, Int<1>{}, Bool<false>{}, Bool<true>{});
+            _invokeSelectRMSNorm(ConstInt<1>{}, n_block, ConstInt<1>{}, ConstBool<false>{}, ConstBool<true>{});
         }
         else if (waves <= 1)
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<1>{}, Bool<false>{}, Bool<false>{});
+            _invokeSelectRMSNorm(m_block, n_block, ConstInt<1>{}, ConstBool<false>{}, ConstBool<false>{});
         }
         else if (waves <= 2)
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<std::min(2, STAGES)>{}, Bool<true>{}, Bool<false>{});
+            _invokeSelectRMSNorm(
+                m_block, n_block, ConstInt<std::min(2, STAGES)>{}, ConstBool<true>{}, ConstBool<false>{});
         }
         else if (waves <= 3)
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<std::min(3, STAGES)>{}, Bool<true>{}, Bool<false>{});
+            _invokeSelectRMSNorm(
+                m_block, n_block, ConstInt<std::min(3, STAGES)>{}, ConstBool<true>{}, ConstBool<false>{});
         }
         else
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<STAGES>{}, Bool<true>{}, Bool<false>{});
+            _invokeSelectRMSNorm(m_block, n_block, ConstInt<STAGES>{}, ConstBool<true>{}, ConstBool<false>{});
         }
     };
 
@@ -169,7 +174,7 @@ void invokeWSLayerNormImpl(
 
         if (desired_m_block >= MAX_M_BLOCK)
         {
-            _invokeSelectPersistentMode(Int<MAX_M_BLOCK>{}, n_block);
+            _invokeSelectPersistentMode(ConstInt<MAX_M_BLOCK>{}, n_block);
             return;
         }
 
@@ -179,7 +184,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (1 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<1>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<1>{}, n_block);
             }
             else
             {
@@ -190,7 +195,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (2 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<2>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<2>{}, n_block);
             }
             else
             {
@@ -201,7 +206,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (4 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<4>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<4>{}, n_block);
             }
             else
             {
@@ -212,7 +217,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (8 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<8>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<8>{}, n_block);
             }
             else
             {
@@ -223,7 +228,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (16 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<16>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<16>{}, n_block);
             }
             else
             {
@@ -234,7 +239,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (32 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<32>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<32>{}, n_block);
             }
             else
             {
@@ -245,7 +250,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (64 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<64>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<64>{}, n_block);
             }
             else
             {
@@ -256,7 +261,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (128 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<128>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<128>{}, n_block);
             }
             else
             {
@@ -272,25 +277,25 @@ void invokeWSLayerNormImpl(
     auto _invokeSelectNBlock = [&]()
     {
         // if (param.n <= 512) {
-        //     _invokeSelectTileSize(Int<512>{});
+        //     _invokeSelectTileSize(ConstInt<512>{});
         // } else if (param.n <= 1024) {
-        //     _invokeSelectTileSize(Int<1024>{});
+        //     _invokeSelectTileSize(ConstInt<1024>{});
         // } else
         if (param.n <= 2048)
         {
-            _invokeSelectTileSize(Int<2048>{});
+            _invokeSelectTileSize(ConstInt<2048>{});
         }
         else if (param.n <= 4096)
         {
-            _invokeSelectTileSize(Int<4096>{});
+            _invokeSelectTileSize(ConstInt<4096>{});
         }
         else if (param.n <= 8192)
         {
-            _invokeSelectTileSize(Int<8192>{});
+            _invokeSelectTileSize(ConstInt<8192>{});
         }
         else if (param.n <= 16384)
         {
-            _invokeSelectTileSize(Int<16384>{});
+            _invokeSelectTileSize(ConstInt<16384>{});
         }
         else
         {
@@ -315,4 +320,6 @@ void invokeWSLayerNorm<GeneralFP4AddBiasResidualPreLayerNormParam<__nv_bfloat16>
     invokeWSLayerNormImpl(param, use_rms_norm, ctas);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

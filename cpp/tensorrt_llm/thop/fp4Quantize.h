@@ -15,14 +15,23 @@
  */
 
 #pragma once
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
 #include <cstdint>
+#include <optional>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
-std::tuple<torch::Tensor, torch::Tensor> fp4_quantize(torch::Tensor const& self, torch::Tensor const& globalScale,
+std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
     int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout);
-}
+
+at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<at::Tensor> const& tokensPerBatch);
+} // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

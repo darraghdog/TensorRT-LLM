@@ -18,10 +18,17 @@ import os
 import pytest
 from defs.common import (convert_weights, get_dummy_spec_decoding_heads,
                          venv_check_call)
-from defs.conftest import skip_fp8_pre_ada
+from defs.conftest import get_sm_version, skip_fp8_pre_ada, skip_post_blackwell
 from defs.trt_test_alternative import check_call
 
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
+
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("num_medusa_heads", [4], ids=['4-heads'])
@@ -79,6 +86,7 @@ def test_llm_medusa_1gpu(batch_size, data_type, medusa_model_roots,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("num_medusa_heads", [4], ids=['4-heads'])
@@ -201,6 +209,16 @@ def test_llm_medusa_fp8_modelOpt_ckpt_1gpu(batch_size, medusa_model_roots,
 def test_with_dummy_medusa(hf_model_root, medusa_example_root, llm_venv,
                            cmodel_dir, engine_dir, batch_size, data_type,
                            num_medusa_heads, use_py_session, model_type):
+
+    # We unset WORLD_SIZE while running tests in specific cluster nodes to
+    # deal with a bug in transformers library. Trainer initialization in
+    # get_dummy_spec_decoding_heads() function fails if WORLD_SIZE is unset.
+    # Preemptively skip tests if WORLD_SIZE is unset.
+    if os.environ.get("WORLD_SIZE") is None:
+        pytest.skip(
+            "[test_with_dummy_medusa] Skipping test due to missing WORLD_SIZE env variable."
+        )
+
     print("Creating dummy Medusa heads...")
     get_dummy_spec_decoding_heads(hf_model_dir=hf_model_root,
                                   save_dir=llm_venv.get_working_directory(),

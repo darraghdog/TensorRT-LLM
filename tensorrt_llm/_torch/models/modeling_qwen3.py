@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
@@ -8,106 +8,75 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from ..speculative import SpecMetadata
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 
-class Qwen3Attention(Attention):
+class Qwen3Attention(QKNormRoPEAttention):
 
     def __init__(
         self,
         model_config: ModelConfig[Qwen3Config],
         layer_idx: Optional[int] = None,
         fuse_qk_norm_rope: bool = True,
+        attn_output_gate: bool = False,
+        use_gemma_rms_norm: bool = False,
+        disable_deep_gemm: bool = False,
+        reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
+        self.pretrained_config = config
+        self.attn_output_gate = attn_output_gate
 
         if getattr(config, "rope_scaling", None) is not None:
+            if "type" in config.rope_scaling:
+                pos_type = config.rope_scaling["type"]
+            elif "rope_type" in config.rope_scaling:
+                pos_type = config.rope_scaling["rope_type"]
+            else:
+                raise ValueError(
+                    "rope_scaling must have type or rope_type field")
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
+                type=PositionEmbeddingType.from_string(pos_type),
                 rope=RopeParams.from_config(config),
-            )
+                mrope_section=config.rope_scaling.get("mrope_section", None),
+                mrope_interleaved=config.rope_scaling.get(
+                    "mrope_interleaved", False))
+            if config.rope_scaling.get("mrope_interleaved", False):
+                fuse_qk_norm_rope = False
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
             )
 
-        self.fuse_qk_norm_rope = fuse_qk_norm_rope
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
-            pos_embd_params=pos_embd_params
-            if not self.fuse_qk_norm_rope else None,
-            qk_norm_type=QkNormType.pre_rope,
+            bias=getattr(config, "attention_bias", None),
+            pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=fuse_qk_norm_rope,
             layer_idx=layer_idx,
+            rope_fusion=not getattr(config, 'disable_fuse_rope', False),
             dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
+            dense_bias=getattr(config, "attention_bias", None),
             config=model_config,
+            attn_output_gate=self.attn_output_gate,
+            use_gemma_rms_norm=use_gemma_rms_norm,
+            disable_deep_gemm=disable_deep_gemm,
+            reduce_output=reduce_output,
         )
-
-        # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__,
-        # so we need to do assignment to record the actual pos_embd_params.
-        self.pos_embd_params = pos_embd_params
-
-        self.q_norm = RMSNorm(hidden_size=self.head_dim,
-                              eps=1e-6,
-                              dtype=config.torch_dtype,
-                              has_weights=True)
-        self.k_norm = RMSNorm(hidden_size=self.head_dim,
-                              eps=1e-6,
-                              dtype=config.torch_dtype,
-                              has_weights=True)
-        self.aux_stream = torch.cuda.Stream()
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-
-    def apply_qk_norm(self, q, k):
-
-        def q_l2norm():
-            return self.q_norm(q.reshape(-1, self.head_dim)).reshape(
-                -1, self.q_size)
-
-        def k_l2norm():
-            return self.k_norm(k.reshape(-1, self.head_dim)).reshape(
-                -1, self.kv_size)
-
-        q, k = maybe_execute_in_parallel(
-            q_l2norm,
-            k_l2norm,
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
-        return q, k
-
-    def apply_rope(self, qkv: torch.Tensor, position_ids: torch.Tensor):
-        if not self.fuse_qk_norm_rope:
-            return super().apply_rope(qkv, position_ids)
-        else:
-            return self.apply_qk_norm_rope(qkv, position_ids)
-
-    def apply_qk_norm_rope(self, qkv, position_ids):
-        torch.ops.trtllm.fused_qk_norm_rope(
-            qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim,
-            self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight, self.pos_embd_params.rope.theta,
-            self.pos_embd_params.is_neox, position_ids.view(-1))
-        return qkv, None, None
 
 
 class Qwen3DecoderLayer(DecoderLayer):
@@ -116,7 +85,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[Qwen3Config],
         layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
@@ -124,28 +93,36 @@ class Qwen3DecoderLayer(DecoderLayer):
             model_config,
             layer_idx=layer_idx,
         )
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             bias=config.mlp_bias if hasattr(config, "mlp_bias") else False,
             dtype=config.torch_dtype,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
             config=model_config,
         )
+
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
+        self.disable_allreduce = (self.mapping.tp_size == 1
+                                  or self.enable_attention_dp)
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        mrope_config: Optional[dict] = None,
+        deepstack_embeds: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -160,6 +137,8 @@ class Qwen3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_allreduce),
             mrope_config=mrope_config,
             **kwargs,
         )
@@ -167,7 +146,21 @@ class Qwen3DecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_allreduce),
+            cutlass_min_latency_mode=False,
+            **kwargs,
+        )
+        if deepstack_embeds is not None and self.layer_idx in range(
+                len(deepstack_embeds)):
+            residual = residual + deepstack_embeds[self.layer_idx]
+
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
 
         return hidden_states, residual
 
@@ -177,7 +170,6 @@ class Qwen3Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen3Config]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
@@ -202,10 +194,13 @@ class Qwen3Model(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        mrope_config: Optional[dict] = None,
+        # args for deepstack
+        deepstack_embeds: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -225,7 +220,10 @@ class Qwen3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
                 mrope_config=mrope_config,
+                deepstack_embeds=deepstack_embeds,
+                **kwargs,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -233,7 +231,7 @@ class Qwen3Model(DecoderModel):
 
 
 @register_auto_model("Qwen3ForCausalLM")
-class Qwen3ForCausalLM(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
 
     def __init__(
         self,
@@ -241,33 +239,5 @@ class Qwen3ForCausalLM(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     ):
         super().__init__(
             Qwen3Model(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
-        )
-
-    # NOTE: Qwen2-VL needs special mrope_config so adding separate forward() function to accept 'mrope_config'.
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        mrope_config: Optional[dict] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        output = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            mrope_config=mrope_config,
-        )
-
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
+            model_config,
         )

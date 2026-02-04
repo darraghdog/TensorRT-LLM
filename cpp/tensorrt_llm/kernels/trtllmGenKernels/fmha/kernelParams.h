@@ -26,15 +26,56 @@
 #include <cute/tensor.hpp>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 #include "fmhaRunnerParams.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//
+// CCCL >= 3.1.0 (CUDA CTK 13.1) introduces the fast_mod_div math operations.
+// The following code makes sure that the host initialization works with older CUDA CTK versions.
+//
+
+// Refer to https://github.com/NVIDIA/cccl/blob/main/libcudacxx/include/cuda/__cmath/fast_modulo_division.h#L76-L81
+// about how to compute the fast modulo division.
+struct FastModDivInt32
+{
+public:
+    FastModDivInt32(int32_t divisor)
+        : mDivisor(divisor)
+    {
+        // Explicitly initialize the unused member variable to avoid compiler warnings.
+        mAdd = 0;
+        mShift = std::max(0, ceilLog2(mDivisor) - 1);
+        mMultiplier = static_cast<uint32_t>(ceilDiv(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
+    }
+
+private:
+    template <typename T>
+    T ceilDiv(T a, T b)
+    {
+        return (a + b - 1) / b;
+    }
+
+    int32_t ceilLog2(int32_t value) const
+    {
+        return static_cast<int32_t>(std::ceil(std::log2(value)));
+    }
+
+private:
+    int32_t mDivisor = 1;
+    uint32_t mMultiplier = 0;
+    uint32_t mAdd = 0;
+    int32_t mShift = 0;
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -55,11 +96,17 @@ struct KernelParams
     // TMA descriptor for V scaling factor.
     CUtensorMap tmaVSf_;
 
+    // grid dimensions, these might differ from actual grid the kernel is launched with
+    // for persistent kernels on Hopper GPUs.
+    int32_t logicalGridDimX, logicalGridDimY, logicalGridDimZ;
+
     // The output pointer (used by STG for last tile).
     void* ptrO;
     // The output SF pointer (used for FP4 output).
     void* ptrSfO;
 
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* ptrAttentionSinks;
     // The cumulative sequence lengths for Q.
     int32_t const* ptrCumSeqLensQ;
     // The cumulative sequence lengths for K/V.
@@ -101,6 +148,8 @@ struct KernelParams
     // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
     // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
     int32_t const* ptrSeqLensKv;
+    // Reserved buffer.
+    int32_t* ptrReservedBuffer;
     // The softmax stats buffer.
     float2* ptrSoftmaxStats;
 
@@ -110,6 +159,9 @@ struct KernelParams
     int32_t mBatchSize;
     // The chunked attention size in log2.
     int32_t mChunkedAttentionSizeLog2;
+    // The factor to add to the maximum value to increase the probability
+    //   of skip correction during next iterations.
+    float mInflateMax;
     // The log of the Sage Attention block size for K.
     int32_t mLogNumEltsPerSageAttnBlkK;
     // The log of the Sage Attention block size for P.
@@ -132,13 +184,16 @@ struct KernelParams
     int32_t mNumHeadsQ;
     // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
     int32_t mNumHeadsQPerKv;
+    // The number of headsQ per K/V head as a fast_mod_div divisor.
+    FastModDivInt32 mNumHeadsQPerKvDivisor{1};
     // The hidden size of O.
     int64_t mNumHiddenEltsO;
-    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
-    // without paddings.
-    int32_t mNumMtpTokens;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
+    // The number of tokensQ per CTA (used for groupsHeadsTokensQ generation kernel).
+    int32_t mNumTokensPerCtaQ;
+    // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
+    int32_t mNumTokensPerPageLog2;
     // The output scale for FP8 quantization.
     float mOutputScale;
     // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -147,16 +202,22 @@ struct KernelParams
     float mScaleSfKv;
     // The SF scale for O.
     float mScaleSfO;
+    // Threshold to decide whether warp skips softmax ops
+    float mSkipSoftmaxThresholdScaleFactor;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
     // kernel when inflight batching is enabled in TRT-LLM.
-    int32_t mStartTokenIdxSfO;
+    int32_t mStartTokenIdx;
     // The sum of sequence lengths for Q and K/V.
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+    // The top k value for sparse MLA.
+    int32_t mSparseMlaTopK;
+    // The flag to use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
-    static auto makeTmaShapeStrideQ(
-        FmhaOptions const& options, bool groupsHeadsQ, int32_t tileSizeQ, int32_t numEltsInClampedHeadDimQ)
+    static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ, bool groupsTokensHeadsQ,
+        int32_t tileSizeQ, int32_t numEltsInClampedHeadDimQ)
     {
 
         //
@@ -215,22 +276,29 @@ struct KernelParams
         // The tile shape for TMA.
         auto tileShapes = std::vector<uint32_t>{
             static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1, static_cast<uint32_t>(tileSizeQ)};
+        // The number of tokensQ per CTA.
+        int32_t numTokensPerCtaQ{tileSizeQ};
+        // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
         if (groupsHeadsQ)
         {
-            if (isSpecDecodingGenerationKernel(options.mKernelType))
+            if (groupsTokensHeadsQ)
             {
-                TLLM_CHECK_WITH_INFO((tileSizeQ % numGroupedHeads == 0), "internal error");
-                tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
-                    static_cast<uint32_t>(numGroupedHeads), 1, static_cast<uint32_t>(tileSizeQ / numGroupedHeads)};
+                // Currently, it requires each CTA to process complete headsQ (i.e. numGroupedHeads) at a
+                // time, so it allows paddings in the end. Removing paddings needs re-organizing the Q
+                // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
+                // this in the future.
+                numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
             }
             else
             {
-                tileShapes = std::vector<uint32_t>{
-                    static_cast<uint32_t>(numEltsInClampedHeadDimQ), static_cast<uint32_t>(tileSizeQ), 1, 1};
+                numGroupedHeads = tileSizeQ;
+                numTokensPerCtaQ = 1;
             }
+            tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
+                static_cast<uint32_t>(numGroupedHeads), 1, static_cast<uint32_t>(numTokensPerCtaQ)};
         }
 
-        return std::make_tuple(shape, stride, tileShapes);
+        return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
     }
 
     // Create the TMA shape/stride for O.
@@ -326,20 +394,22 @@ struct KernelParams
 
     // Compute the strides for K and V.
     template <class FmhaOptions>
-    static auto makeStrideKv(FmhaOptions const& options, bool isK)
+    static auto makeStrideKv(FmhaOptions const& options, Data_type dtypeKv, bool isK)
     {
 
         // The maximum headDim of K and V.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
         int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
         // The hidden dimension for the keys/vals.
-        int32_t const hiddenDimK{options.mNumHeadsKv * maxHeadDimKv};
+        int32_t const hiddenDimK{options.mNumHeadsKv * options.mHeadDimQk};
+        int32_t const hiddenDimV{options.mNumHeadsKv * options.mHeadDimV};
+        int32_t const maxHiddenDimKv{std::max(hiddenDimK, hiddenDimV)};
         // The hidden dimension when Q, K and V are packed together.
         int32_t const hiddenDimQkv{
             options.mNumHeadsQ * options.mHeadDimQk + options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV)};
 
         // The stride between the different keys/vals.
-        int32_t strideKeysVals{hiddenDimK};
+        int32_t strideKeysVals{isK ? hiddenDimK : hiddenDimV};
         if (isPagedKv(options.mQkvLayout))
         {
             strideKeysVals = maxHeadDimKv;
@@ -351,6 +421,12 @@ struct KernelParams
         else if (isContiguousKv(options.mQkvLayout))
         {
             strideKeysVals = maxHeadDimKv;
+        }
+        else if (isSeparateQkv(options.mQkvLayout) && !isK && options.mHeadDimQkNope > 0 && dtypeKv != DATA_TYPE_E4M3)
+        {
+            // Non-FP8 context MLA: tensor V is not contiguous. The token stride is mNumHeadsKv * (mHeadDimQkNope +
+            // mHeadDimV).
+            strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQkNope + options.mHeadDimV);
         }
 
         // The stride between heads.
@@ -368,7 +444,7 @@ struct KernelParams
         int32_t strideBatch{options.mMaxSeqLenKv * hiddenDimK};
         if (isPagedKv(options.mQkvLayout))
         {
-            strideBatch = options.mNumTokensPerPage * hiddenDimK;
+            strideBatch = options.mNumTokensPerPage * maxHiddenDimKv;
         }
         else if (isContiguousKv(options.mQkvLayout))
         {
@@ -376,6 +452,7 @@ struct KernelParams
         }
         else
         {
+            // Always variable seqlens.
             strideBatch = 0;
         }
 
@@ -385,17 +462,21 @@ struct KernelParams
 
     // Create the TMA shape/stride for K.
     template <class FmhaOptions>
-    static auto makeTmaShapeStrideKv(
-        FmhaOptions const& options, KernelParams const& params, Data_type dtypeKv, bool isK)
+    static auto makeTmaShapeStrideKv(FmhaOptions const& options, KernelParams const& params, Data_type dtypeKv,
+        bool isK, bool storeTransformedKvInTmem)
     {
         // The shape elements.
         auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
         // The stride elements.
-        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
+        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, dtypeKv, isK);
 
-        // The maximum headDim of K and V.
+        // The headDim.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-        int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
+        int32_t headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+        if (isPagedKv(options.mQkvLayout) || isContiguousKv(options.mQkvLayout))
+        {
+            headDim = std::max(options.mHeadDimQk, options.mHeadDimV);
+        }
 
         // For K, the cute layout: (numKeys, headDim, ((numHeadsQPerKv, numHeadsKv),
         // batchSize)):(strideKeys, _1, _0, strideHeads, strideBatch). Cute swaps the first two
@@ -409,9 +490,13 @@ struct KernelParams
         // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
         // The column index and strides needs to divide by 2.
         auto const colIdxDivisor = dtypeKv == DATA_TYPE_E2M1 ? 2 : 1;
+        // When storeTransformedKvInTmem is true, the dimensions reflect FP4 element dimensions, thus
+        // no need to divide.
+
         auto shape
-            = std::vector<uint64_t>{static_cast<uint64_t>(maxHeadDimKv / colIdxDivisor), static_cast<uint64_t>(numKeys),
-                static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(batchSize)};
+            = std::vector<uint64_t>{static_cast<uint64_t>(storeTransformedKvInTmem ? headDim : headDim / colIdxDivisor),
+                static_cast<uint64_t>(numKeys), static_cast<uint64_t>(options.mNumHeadsKv),
+                static_cast<uint64_t>(batchSize)};
         auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(strideKeys / colIdxDivisor),
             static_cast<uint64_t>(strideHeads / colIdxDivisor), static_cast<uint64_t>(strideBatch / colIdxDivisor)};
 
@@ -420,16 +505,21 @@ struct KernelParams
 
     // Create the TMA shape/stride for KV scaling factors.
     template <class FmhaOptions>
-    static auto makeTmaShapeStrideKvSf(FmhaOptions const& options, KernelParams const& params, bool isK)
+    static auto makeTmaShapeStrideKvSf(
+        FmhaOptions const& options, KernelParams const& params, Data_type dtypeKv, bool isK)
     {
         // The shape elements.
         auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
         // The stride elements.
-        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
+        auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, dtypeKv, isK);
 
-        // The maximum headDim of K and V.
+        // The headDim.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-        int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
+        int32_t headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+        if (isPagedKv(options.mQkvLayout) || isContiguousKv(options.mQkvLayout))
+        {
+            headDim = std::max(options.mHeadDimQk, options.mHeadDimV);
+        }
 
         // The number of elements per SF.
         int32_t NumEltsPerSf = 16;
@@ -443,7 +533,7 @@ struct KernelParams
         // Note that it only works for pagedKv layout.
         TLLM_CHECK_WITH_INFO(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
 
-        auto shape = std::vector<uint64_t>{16, static_cast<uint64_t>(numKeys * maxHeadDimKv / NumEltsPerSf / 16),
+        auto shape = std::vector<uint64_t>{16, static_cast<uint64_t>(numKeys * headDim / NumEltsPerSf / 16),
             static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(batchSize)};
         auto stride = std::vector<uint64_t>{1, 16, static_cast<uint64_t>(strideHeads / NumEltsPerSf),
             static_cast<uint64_t>(strideBatch / NumEltsPerSf)};
@@ -453,19 +543,20 @@ struct KernelParams
 
     // Prepare pointers for TMA descriptors.
     static std::tuple<void const*, void const*, void const*> getDevicePtrs(
-        TllmGenFmhaRunnerParams const& runnerParams, int32_t bytesPerElt)
+        TllmGenFmhaRunnerParams const& runnerParams, int32_t bitsPerElt)
     {
         // Declare the q, k, v ptrs.
-        void const *qPtr{runnerParams.qPtr}, *kPtr, *vPtr;
+        void const *qPtr{runnerParams.qPtr}, *kPtr{runnerParams.kPtr}, *vPtr{runnerParams.vPtr};
 
         // Set Q, K and V pointer from packed QKV tensor.
         if (isPackedQkv(runnerParams.mQkvLayout))
         {
             qPtr = runnerParams.qkvPtr;
             kPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr)
-                + runnerParams.mNumHeadsQ * runnerParams.mHeadDimQk * bytesPerElt);
+                + runnerParams.mNumHeadsQ * runnerParams.mHeadDimQk * bitsPerElt / 8 /*bits*/);
             vPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr)
-                + (runnerParams.mNumHeadsQ + runnerParams.mNumHeadsKv) * runnerParams.mHeadDimQk * bytesPerElt);
+                + (runnerParams.mNumHeadsQ + runnerParams.mNumHeadsKv) * runnerParams.mHeadDimQk * bitsPerElt
+                    / 8 /*bits*/);
         }
         // Set K and V pointer from pagedKv tensor.
         else if (isPagedKv(runnerParams.mQkvLayout))
@@ -482,12 +573,9 @@ struct KernelParams
             // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
             int32_t const maxHeadDimKv{std::max(runnerParams.mHeadDimQk, runnerParams.mHeadDimV)};
             vPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.kvPtr)
-                + runnerParams.mNumHeadsKv * runnerParams.mMaxSeqLenCacheKv * maxHeadDimKv * bytesPerElt);
+                + runnerParams.mNumHeadsKv * runnerParams.mMaxSeqLenCacheKv * maxHeadDimKv * bitsPerElt / 8 /*bits*/);
         }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(false, "Unexpected qkv layout %d", static_cast<int32_t>(runnerParams.mQkvLayout));
-        }
+
         // Return the pointers.
         return std::make_tuple(qPtr, kPtr, vPtr);
     }
@@ -496,12 +584,16 @@ struct KernelParams
     template <class FmhaOptions>
     static CUtensorMap buildNdTmaDescriptor(FmhaOptions const& options, Data_type dtypeElt,
         std::vector<uint64_t> const& shapes, std::vector<uint64_t> const& strides,
-        std::vector<uint32_t> const& tileShapes, void* gmemAddr, bool swizzled = true)
+        std::vector<uint32_t> const& tileShapes, void* gmemAddr, bool swizzled = true, bool unpack4b = false)
     {
         CUtensorMap desc{};
         // The data type.
         CUtensorMapDataType tmaDataFormat;
-        if (dtypeElt == DATA_TYPE_E2M1 || dtypeElt == DATA_TYPE_E4M3)
+        if (dtypeElt == DATA_TYPE_E2M1)
+        {
+            tmaDataFormat = unpack4b ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B : CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        }
+        else if (dtypeElt == DATA_TYPE_E4M3)
         {
             tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
         }
@@ -525,6 +617,10 @@ struct KernelParams
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
         }
+        else if (tmaDataFormat == CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B)
+        {
+            swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
+        }
         else if ((numBytesInLeadingDim % 128) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
@@ -547,8 +643,8 @@ struct KernelParams
 
         // Check shape must be in range [1, 2^32]
         int32_t dim = shapes.size();
-        // Max five dimension and min 3 dimension.
-        TLLM_CHECK((dim <= 5) && (dim >= 3));
+        // Max five dimension and min 2 dimension.
+        TLLM_CHECK((dim <= 5) && (dim >= 2));
         // Check shape range.
         for (int32_t ii = 0; ii < dim; ++ii)
         {
@@ -583,6 +679,9 @@ struct KernelParams
         {
             char const* err_str;
             cuGetErrorString(result, &err_str);
+            // Note that the error is thrown out before launching fmha kernels, so it is highly possible that
+            // the errors are broadcasted by previous kernels. Please enable CUDA_LAUNCH_BLOCKING or use cuda-gdb
+            // for more details.
             std::cerr << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
             std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
                       << std::endl;
@@ -611,7 +710,7 @@ struct KernelParams
         KernelParams params;
 
         // Get the device pointers for TMA descriptors.
-        auto [qPtr, kPtr, vPtr] = getDevicePtrs(options, get_size_in_bytes(kernelMeta.mDataTypeKv));
+        auto [qPtr, kPtr, vPtr] = getDevicePtrs(options, get_size_in_bits(kernelMeta.mDataTypeKv));
 
         // The maximum headDim of K and V.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -631,8 +730,8 @@ struct KernelParams
         int32_t numEltsInClampedHeadDimQ = std::min(numEltsIn128BQ, options.mHeadDimQk);
 
         // Shape/stride for gmem tensor Q.
-        auto [shapeQ, strideQ, tileShapeQ]
-            = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+        auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ,
+            kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
         // Build tma descriptor for Q.
         params.tmaQ_ = buildNdTmaDescriptor(
             options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
@@ -644,29 +743,47 @@ struct KernelParams
         // The number of elements in 128B for Q.
         int32_t numEltsIn128BKv = (128 * 8) / get_size_in_bits(kernelMeta.mDataTypeKv);
         // The number of head elts (per token) in each block of shared memory (see above explanation).
-        int32_t numEltsInClampedHeadDimKv = std::min(numEltsIn128BKv, maxHeadDimKv);
+        // HeadDim will be split into multiple headDimStages (128) if maxHeadDimKv > 128.
+        int32_t numEltsInClampedHeadDimKv = std::min({numEltsIn128BKv, maxHeadDimKv, 128});
 
-        // Shape/stride for gmem tensor Kv.
-        auto [shapeK, strideK] = makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv, /*isK*/ true);
-        auto [shapeV, strideV] = makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv, /*isK*/ false);
-        // Build tma descriptor for K.
         // Do we have to transform K/V before MMA?
         bool const transformsKv{kernelMeta.mDataTypeKv != kernelMeta.mDataTypeQ};
+        // Whether store transformed K/V in TMEM.
+        bool const isSwapsMmaAb = isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType));
+        bool const storeTransformedKvInTmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1
+            && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 && maxHeadDimKv >= 128 && isSwapsMmaAb};
+
+        // Shape/stride for gmem tensor Kv.
+        auto [shapeK, strideK]
+            = makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv, /*isK*/ true, storeTransformedKvInTmem);
+        auto [shapeV, strideV]
+            = makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv, /*isK*/ false, storeTransformedKvInTmem);
+        // Whether swizzle is needed for K/V.
+        bool const swizzleKv{storeTransformedKvInTmem || !transformsKv};
         // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
-        auto const numEltsDivisor = kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 ? 2 : 1;
+        auto const numEltsDivisor = kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;
         // The tileShapes for K/V.
         std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
+
+        // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
+        // headDimQk).
+        if (options.mSparseMla)
+        {
+            shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
+            strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+            tileShapeKv[1] = 1;
+        }
+
         // Build tma descriptor for K.
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
-            /*swizzled = */ !transformsKv);
+            /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
         // Build tma descriptor for V.
         params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv,
             const_cast<void*>(vPtr),
-            /*swizzled = */ !transformsKv);
-
+            /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
         // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
         if (kernelMeta.mDataTypeKv == DATA_TYPE_E2M1)
         {
@@ -674,7 +791,8 @@ struct KernelParams
             int32_t NumEltsPerSf = 16;
             // Compute the shape and stride for SF tensor.
             // FIXME: assume K and V uses the same shape.
-            auto [shapeKvSf, strideKvSf] = makeTmaShapeStrideKvSf(options, params, /*isK*/ true);
+            auto [shapeKvSf, strideKvSf]
+                = makeTmaShapeStrideKvSf(options, params, kernelMeta.mDataTypeKv, /*isK*/ true);
 
             // The tileShapes for K/V.
             std::vector<uint32_t> tileShapeKvSf(shapeKvSf.size(), 1);
@@ -685,12 +803,12 @@ struct KernelParams
             // headDim / NumEltsPerSf / 16). See makeTmaShapeStrideKvSf for details. Build tma descriptor
             // for K SF.
             params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf, tileShapeKvSf,
-                const_cast<void*>(options.kSfBasePtr),
+                const_cast<void*>(options.kvSfPtr),
                 /*swizzled = */ false);
 
             // Build tma descriptor for V SF.
             params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf, tileShapeKvSf,
-                const_cast<void*>(options.vSfBasePtr),
+                const_cast<void*>(options.kvSfPtr),
                 /*swizzled = */ false);
         }
 
@@ -705,6 +823,7 @@ struct KernelParams
             options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO, const_cast<void*>(options.oPtr));
 
         // Set the other kernel parameters.
+        params.ptrAttentionSinks = options.attentionSinksPtr;
         params.ptrCumSeqLensQ = options.cumSeqLensQPtr;
         params.ptrCumSeqLensKv = options.cumSeqLensKvPtr;
 
@@ -743,7 +862,8 @@ struct KernelParams
         params.ptrSoftmaxStats = options.softmaxStatsPtr;
 
         params.mAttentionWindowSize = options.mAttentionWindowSize;
-        if (isSlidingOrChunkedCausalMask(options.mMaskType) && options.mMaxSeqLenKv > options.mChunkedAttentionSize)
+        if (isSlidingOrChunkedCausalMask(static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType))
+            && options.mChunkedAttentionSize != INT_MAX)
         {
             TLLM_CHECK_WITH_INFO((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                 "Chunked attention size must be a power of 2");
@@ -759,20 +879,31 @@ struct KernelParams
         params.mMaxNumCtasQ = maxNumCtasQ;
         params.mMaxNumCtasKv = maxNumCtasKv;
         params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
-        // TODO: just use mMaxSeqLenQ for number of MTP tokens.
-        params.mNumMtpTokens = options.mMaxSeqLenQ;
         params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
         params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
         params.mBatchSize = options.mBatchSize;
         params.mNumHeadsQ = options.mNumHeadsQ;
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
+        params.mNumHeadsQPerKvDivisor = FastModDivInt32{options.mNumHeadsQPerKv};
         params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumTokensPerCtaQ = numTokensPerCtaQ;
+        params.mNumTokensPerPageLog2 = 0;
+        if (isPagedKv(options.mQkvLayout))
+        {
+            TLLM_CHECK_WITH_INFO((options.mNumTokensPerPage & (options.mNumTokensPerPage - 1)) == 0,
+                "NumTokensPerPage must be a power of 2");
+            params.mNumTokensPerPageLog2 = static_cast<int32_t>(std::log2(options.mNumTokensPerPage));
+        }
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
-        params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
-        params.mScaleSfKv = options.mScaleSfKv;
-
+        params.mStartTokenIdx = options.mSfStartTokenIdx;
+        // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
+        TLLM_CHECK_WITH_INFO(
+            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
+        params.mSparseMlaTopK = options.mSparseMlaTopK;
+        params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
+        params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
         return params;
     }
 };
@@ -780,4 +911,5 @@ struct KernelParams
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

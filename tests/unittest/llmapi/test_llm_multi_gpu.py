@@ -8,29 +8,31 @@ from typing import Optional
 import pytest
 from parameterized import parameterized
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutorProxy
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 # isort: off
+from .lora_test_utils import check_llama_7b_multi_lora_from_request_test_harness
 from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, llm_return_logprobs_test_harness,
-    default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
-    llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
-    llama_v2_13b_lora_test_harness, llm_check_output,
+    default_model_name, get_model_path, llama_model_path,
+    llama_v2_7b_prompt_adapter_test_harness,
+    llama_v2_13b_lora_from_dir_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
     llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
-    tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
 from .test_llm_kv_cache_events import create_llm
-from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
+from utils.util import (skip_gpu_memory_less_than, skip_single_gpu, skip_ray,
                         unittest_name_func, force_ampere)
 # isort: on
 
@@ -73,7 +75,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@pytest.mark.skip(reason="https://nvbugs/5266240")
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
@@ -134,25 +135,17 @@ def test_llm_return_logprobs_tp2(prompt_logprobs: Optional[int],
                                      tp_size=2)
 
 
-@pytest.mark.parametrize("use_auto_parallel", [True, False],
-                         ids=["enable_auto_parallel", "disable_auto_parallel"])
 @pytest.mark.parametrize("from_ckpt", [True, False],
                          ids=["from_ckpt", "from_hf"])
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_generate_async_tp2(
-        engine_from_checkpoint: tempfile.TemporaryDirectory, from_ckpt: bool,
-        use_auto_parallel: bool):
-    if use_auto_parallel and from_ckpt:
-        pytest.skip("Skip auto parallel for TP2 checkpoint")
+        engine_from_checkpoint: tempfile.TemporaryDirectory, from_ckpt: bool):
     model_dir = engine_from_checkpoint.name if from_ckpt else get_model_path(
         llama_model_path)
     tokenizer_dir = get_model_path(llama_model_path)
     tokenizer = TransformersTokenizer.from_pretrained(tokenizer_dir)
-    _test_llm_generate_async(model_dir,
-                             tp_size=2,
-                             use_auto_parallel=use_auto_parallel,
-                             tokenizer=tokenizer)
+    _test_llm_generate_async(model_dir, tp_size=2, tokenizer=tokenizer)
 
 
 @skip_gpu_memory_less_than(70 * 1024**3)
@@ -200,7 +193,6 @@ def test_llm_pp2():
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=8),
                      pipeline_parallel_size=2,
-                     auto_parallel=False,
                      kv_cache_config=global_kv_cache_config)
 
 
@@ -246,16 +238,6 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 
 @pytest.mark.gpu4
-@pytest.mark.part0
-def test_tinyllama_guided_decoding_tp2pp2():
-    pytest.skip(reason="https://nvbugs/5244006")
-    tinyllama_guided_decoding_test_harness(
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config)
-
-
-@pytest.mark.gpu4
 def test_tinyllama_logits_processor_tp2pp2():
     tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
                                             pipeline_parallel_size=2)
@@ -264,17 +246,28 @@ def test_tinyllama_logits_processor_tp2pp2():
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_v2_13b_lora_tp2():
-    llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
-                                   kv_cache_config=global_kv_cache_config)
+    llama_v2_13b_lora_from_dir_test_harness(
+        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_test_harness(tensor_parallel_size=2,
-                                     max_loras=1,
-                                     max_cpu_loras=8,
-                                     kv_cache_config=global_kv_cache_config)
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=1,
+                             max_cpu_loras=8)
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        enable_lora=True,
+        build_config=BuildConfig(lora_config=lora_config),
+        lora_config=lora_config,
+        tensor_parallel_size=2,
+        fast_build=True,
+        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
@@ -334,7 +327,6 @@ def test_llm_multi_node_pytorch(nworkers: int):
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
-    pytest.skip(reason="https://nvbugs/5302891")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
@@ -463,8 +455,9 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
     llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
+@skip_ray
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():
@@ -494,11 +487,12 @@ def test_llm_get_kv_cache_events_tp2():
     # created + stored events
     assert events and len(events) >= 2
     for event in events:
+        print(f"event: {event}")
         if event:
-            if event[0]["event_id"] == 0:
-                assert event[0]["data"]["type"] == "created"
-            elif event[0]["event_id"] == 1:
-                assert event[0]["data"]["type"] == "stored"
+            if event["event_id"] == 0:
+                assert event["data"]["type"] == "created"
+            elif event["event_id"] == 1:
+                assert event["data"]["type"] == "stored"
 
 
 @pytest.fixture(scope="module")

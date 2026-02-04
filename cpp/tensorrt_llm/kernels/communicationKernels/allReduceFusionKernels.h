@@ -15,16 +15,19 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 template <typename DType>
 struct ElemsPerAccess;
@@ -132,10 +135,13 @@ struct AllReduceFusionParams
     float rms_eps;
     float* scale_factor;
     bool use_oneshot;
-    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+    QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
     AllReduceFusionPattern pattern;
+    bool trigger_completion_at_end = true;
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);
-} // namespace tensorrt_llm::kernels::ar_fusion
+} // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END

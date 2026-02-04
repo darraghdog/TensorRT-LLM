@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -22,6 +23,8 @@
     && ((TORCH_VERSION_MAJOR > 1) || ((TORCH_VERSION_MAJOR == 1) && (TORCH_VERSION_MINOR >= 9)))
 #define TORCH_IS_AT_LEAST_v190
 #endif
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -349,34 +352,89 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
     return packed_weight;
 }
 
+Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_size)
+{
+    // weight (n, k / 2)
+    // scale (n, k / group_size)
+
+    CHECK_CPU(weight);
+    CHECK_CPU(scale);
+    CHECK_CONTIGUOUS(weight);
+    CHECK_CONTIGUOUS(scale);
+    TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
+    TORCH_CHECK(weight.dtype() == torch::kUInt8, "Weight must be a packed int8 tensor");
+    TORCH_CHECK(scale.dtype() == torch::kUInt8, "Scale must be a int8 tensor");
+
+    TORCH_CHECK(weight.size(0) == scale.size(0))
+    TORCH_CHECK(weight.size(1) * 2 == scale.size(1) * group_size)
+
+    uint8_t* weight_packed_ptr = get_ptr<uint8_t>(weight);
+    __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(get_ptr<uint8_t>(scale));
+
+    int const n = weight.size(0);
+    int const k = weight.size(1) * 2;
+
+    Tensor dequant_weight = torch::empty({n, k}, torch::dtype(torch::kFloat).device(torch::kCPU).requires_grad(false));
+    float* dequant_weight_ptr = get_ptr<float>(dequant_weight);
+
+    float fp4_lut[] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
+
+    for (int packed_idx = 0; packed_idx < weight.numel(); ++packed_idx)
+    {
+        int8_t weight_packed_data = weight_packed_ptr[packed_idx];
+
+        uint8_t weight_low_ = weight_packed_data & 0xF;
+        uint8_t weight_high_ = (weight_packed_data & 0xF0) >> 4;
+
+        float weight_low = fp4_lut[weight_low_];
+        float weight_high = fp4_lut[weight_high_];
+
+        int scale_n_idx = packed_idx / (k / 2);
+        int scale_k_idx = ((packed_idx * 2) % k) / group_size;
+
+        float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale.size(1) + scale_k_idx]);
+
+        dequant_weight_ptr[2 * packed_idx] = weight_low * scale_;
+        dequant_weight_ptr[2 * packed_idx + 1] = weight_high * scale_;
+    }
+
+    return dequant_weight;
+}
+
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 // Utility methods that may be useful for preprocessing weights in torch.
 static auto symmetric_quantize_last_axis_of_batched_matrix
     = torch::RegisterOperators("trtllm::symmetric_quantize_last_axis_of_batched_matrix",
-        &torch_ext::symmetric_quantize_last_axis_of_batched_matrix);
+        &tensorrt_llm::torch_ext::symmetric_quantize_last_axis_of_batched_matrix);
 
 static auto preprocess_weights_for_mixed_gemm = torch::RegisterOperators(
-    "trtllm::preprocess_weights_for_mixed_gemm", &torch_ext::preprocess_weights_for_mixed_gemm);
+    "trtllm::preprocess_weights_for_mixed_gemm", &tensorrt_llm::torch_ext::preprocess_weights_for_mixed_gemm);
 
 static auto unpack_int4_packed_tensor_to_int8 = torch::RegisterOperators(
-    "trtllm::unpack_int4_packed_tensor_to_int8", &torch_ext::unpack_int4_packed_tensor_to_int8);
+    "trtllm::unpack_int4_packed_tensor_to_int8", &tensorrt_llm::torch_ext::unpack_int4_packed_tensor_to_int8);
 
-static auto pack_int8_tensor_to_packed_int4
-    = torch::RegisterOperators("trtllm::pack_int8_tensor_to_packed_int4", &torch_ext::pack_int8_tensor_to_packed_int4);
+static auto pack_int8_tensor_to_packed_int4 = torch::RegisterOperators(
+    "trtllm::pack_int8_tensor_to_packed_int4", &tensorrt_llm::torch_ext::pack_int8_tensor_to_packed_int4);
 
 // Utility methods exposed purely for unit tests in torch.
 static auto _symmetric_quantize_last_axis_of_batched_matrix
     = torch::RegisterOperators("trtllm::_symmetric_quantize_last_axis_of_batched_matrix",
-        &torch_ext::_symmetric_quantize_last_axis_of_batched_matrix);
+        &tensorrt_llm::torch_ext::_symmetric_quantize_last_axis_of_batched_matrix);
 
-static auto add_bias_and_interleave_int4s
-    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int4s", &torch_ext::add_bias_and_interleave_int4s);
+static auto add_bias_and_interleave_int4s = torch::RegisterOperators(
+    "trtllm::_add_bias_and_interleave_int4s", &tensorrt_llm::torch_ext::add_bias_and_interleave_int4s);
 
-static auto add_bias_and_interleave_int8s
-    = torch::RegisterOperators("trtllm::_add_bias_and_interleave_int8s", &torch_ext::add_bias_and_interleave_int8s);
+static auto add_bias_and_interleave_int8s = torch::RegisterOperators(
+    "trtllm::_add_bias_and_interleave_int8s", &tensorrt_llm::torch_ext::add_bias_and_interleave_int8s);
 
-static auto permute_B_rows_for_mixed_gemm
-    = torch::RegisterOperators("trtllm::_permute_B_rows_for_mixed_gemm", &torch_ext::permute_B_rows_for_mixed_gemm);
+static auto permute_B_rows_for_mixed_gemm = torch::RegisterOperators(
+    "trtllm::_permute_B_rows_for_mixed_gemm", &tensorrt_llm::torch_ext::permute_B_rows_for_mixed_gemm);
 
-static auto subbyte_transpose = torch::RegisterOperators("trtllm::_subbyte_transpose", &torch_ext::subbyte_transpose);
+static auto subbyte_transpose
+    = torch::RegisterOperators("trtllm::_subbyte_transpose", &tensorrt_llm::torch_ext::subbyte_transpose);
+
+static auto mxfp4_dequantize_unswizzled = torch::RegisterOperators(
+    "trtllm::mxfp4_dequantize_unswizzled", &tensorrt_llm::torch_ext::mxfp4_dequantize_unswizzled);

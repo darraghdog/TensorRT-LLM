@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -26,9 +27,11 @@ namespace jit
 
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
 bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
+bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
 bool supportConfigTllmGen(
     XQAParams const& xqaParams, int SM, bool forConfigurePlugin, TllmGenFmhaRunner const* tllmRunner);
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

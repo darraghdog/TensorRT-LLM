@@ -12,13 +12,14 @@ import subprocess
 import sys
 
 import pygit2
+from docutils import nodes
 
 sys.path.insert(0, os.path.abspath('.'))
+sys.path.insert(0, os.path.abspath('_ext'))
 
-project = 'TensorRT-LLM'
+project = 'TensorRT LLM'
 copyright = '2025, NVidia'
 author = 'NVidia'
-branch_name = pygit2.Repository('.').head.shorthand
 html_show_sphinx = False
 
 # Get the git commit hash
@@ -43,26 +44,44 @@ version = version_module.__version__
 templates_path = ['_templates']
 exclude_patterns = ['performance/performance-tuning-guide/introduction.md']
 
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+CPP_XML_INDEX = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "cpp_docs", "xml", "index.xml"))
+HAS_CPP_XML = os.path.exists(CPP_XML_INDEX)
+if not HAS_CPP_XML:
+    exclude_patterns.append('_cpp_gen/**')
+
 extensions = [
     'sphinx.ext.duration',
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
+    'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
-    "breathe",
     'sphinx.ext.todo',
     'sphinx.ext.autosectionlabel',
     'sphinxarg.ext',
     'sphinx_click',
     'sphinx_copybutton',
-    'sphinxcontrib.autodoc_pydantic'
+    'sphinxcontrib.autodoc_pydantic',
+    'sphinx_togglebutton',
+    'trtllm_config_selector',
 ]
 
+if HAS_CPP_XML:
+    extensions.append("breathe")
+
+autodoc_member_order = 'bysource'
 autodoc_pydantic_model_show_json = True
 autodoc_pydantic_model_show_config_summary = True
 autodoc_pydantic_field_doc_policy = "description"
 autodoc_pydantic_model_show_field_list = True  # Display field list with descriptions
+autodoc_pydantic_model_member_order = "groupwise"
+autodoc_pydantic_model_hide_pydantic_methods = True
+autodoc_pydantic_field_list_validators = False
+autodoc_pydantic_settings_signature_prefix = ""  # remove any prefix
+autodoc_pydantic_settings_hide_reused_validator = True  # hide all the validator should be better
 
 myst_url_schemes = {
     "http":
@@ -70,14 +89,38 @@ myst_url_schemes = {
     "https":
     None,
     "source":
-    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
+    "https://github.com/NVIDIA/TensorRT-LLM/tree/" + commit_hash + "/{{path}}",
 }
 
 myst_heading_anchors = 4
 
 myst_enable_extensions = [
     "deflist",
+    "substitution",
+    "dollarmath",
+    "amsmath",
 ]
+
+myst_substitutions = {
+    "version":
+    version,
+    "version_quote":
+    f"`{version}`",
+    "container_tag_admonition":
+    r"""
+```{admonition} Container image tags
+:class: dropdown note
+In the example shell commands, `x.y.z` corresponds to the TensorRT-LLM container
+version to use. If omitted, `IMAGE_TAG` will default to `tensorrt_llm.__version__`
+(e.g., this documentation was generated from the {{version_quote}} source tree).
+If this does not work, e.g., because a container for the version you are
+currently working with has not been released yet, you can try using a
+container published for a previous
+[GitHub pre-release or release](https://github.com/NVIDIA/TensorRT-LLM/releases)
+(see also [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)).
+```
+    """
+}
 
 autosummary_generate = True
 copybutton_exclude = '.linenos, .gp, .go'
@@ -108,24 +151,45 @@ html_theme_options = {
     ]
 }
 
-# ------------------------  C++ Doc related  --------------------------
-# Breathe configuration
-breathe_default_project = "TensorRT-LLM"
-breathe_projects = {"TensorRT-LLM": "../cpp_docs/xml"}
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if HAS_CPP_XML:
+    breathe_default_project = "TensorRT-LLM"
+    breathe_projects = {"TensorRT-LLM": "../cpp_docs/xml"}
+else:
+    breathe_projects = {}
 
 CPP_INCLUDE_DIR = os.path.join(SCRIPT_DIR, '../../cpp/include/tensorrt_llm')
 CPP_GEN_DIR = os.path.join(SCRIPT_DIR, '_cpp_gen')
 print('CPP_INCLUDE_DIR', CPP_INCLUDE_DIR)
 print('CPP_GEN_DIR', CPP_GEN_DIR)
 
+html_css_files = [
+    'custom.css',
+]
+
+
+def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
+    """A custom role for displaying tags."""
+    options = options or {}
+    content = content or []
+    tag_name = text.lower()
+    node = nodes.literal(text, text, classes=['tag', tag_name])
+    return [node], []
+
 
 def setup(app):
-    from helper import generate_examples, generate_llmapi
+    from helper import generate_examples, generate_llmapi, update_version
+
+    try:
+        from tensorrt_llm.llmapi.utils import tag_llm_params
+        tag_llm_params()
+    except ImportError:
+        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
+
+    app.add_role('tag', tag_role)
 
     generate_examples()
     generate_llmapi()
+    update_version()
 
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):
@@ -152,10 +216,11 @@ Runtime
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
-# compile cpp doc
-subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
-gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
-            runtime_summary)
+if HAS_CPP_XML:
+    # compile cpp doc
+    subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+    gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
+                runtime_summary)
 
 executor_summary = f"""
 Executor
@@ -166,6 +231,7 @@ Executor
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
-subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
-gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
-            executor_summary)
+if HAS_CPP_XML:
+    subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+    gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
+                executor_summary)

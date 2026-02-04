@@ -20,6 +20,7 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import (get_init_params, str_dtype_to_torch,
                                  str_dtype_to_trt)
 from tensorrt_llm.layers.lora import LoraParams
@@ -40,21 +41,24 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from ..quantization import GroupwiseQuantAlgo, QuantMode
-from ..quantization.functional import (postprocess_weight_only,
+from ..quantization.functional import (get_weight_scale_interleave_factor,
+                                       postprocess_weight_only,
                                        preprocess_weights_for_mixed_gemm,
                                        quantize)
 from .linear import RowLinear
 from .mlp import MLP, GatedMLP
 
 activation_str_to_int_map = {
-    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h
-    "gelu": 0,
-    "gelu_new": 0,
-    "relu": 1,
-    "silu": 2,
-    "swiglu": 3,
-    "geglu": 4,
-    "identity": 5,
+    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+    "gelu": int(ActivationType.Gelu),
+    "gelu_new": int(ActivationType.Gelu),
+    "relu": int(ActivationType.Relu),
+    "silu": int(ActivationType.Silu),
+    "swiglu": int(ActivationType.Swiglu),
+    "geglu": int(ActivationType.Geglu),
+    "swiglu_bias": int(ActivationType.SwigluBias),
+    "identity": int(ActivationType.Identity),
+    "relu2": int(ActivationType.Relu2),
 }
 
 
@@ -488,11 +492,18 @@ class MOEWeightWrapper(Module):
             self.alpha = Parameter(shape=(experts_per_node, ),
                                    dtype=trt.float32)
         elif quant_mode.has_per_group_scaling():
-            self.weight = Parameter(shape=(experts_per_node, in_features,
-                                           out_features // 4),
-                                    dtype=dtype)
-            scale_shape = (experts_per_node, in_features // group_size,
-                           out_features)
+            self.weight = Parameter(
+                shape=(experts_per_node, in_features,
+                       out_features // 4),  # int4 <--> fp16/bf16
+                dtype=dtype)
+            if groupwise_quant_algo & GroupwiseQuantAlgo.W4A8_ALPHA:
+                scale_interleave_factor = get_weight_scale_interleave_factor(
+                    in_features, group_size)
+            else:
+                scale_interleave_factor = 1
+            scale_shape = (experts_per_node,
+                           in_features // group_size // scale_interleave_factor,
+                           out_features * scale_interleave_factor)
             self.weights_scaling_factor = Parameter(shape=scale_shape,
                                                     dtype=dtype)
             if groupwise_quant_algo & GroupwiseQuantAlgo.ZERO:
@@ -500,8 +511,8 @@ class MOEWeightWrapper(Module):
             else:
                 self.register_parameter('zero', None)
             if groupwise_quant_algo & GroupwiseQuantAlgo.PRE_QUANT_SCALE:
-                self.prequant_scaling_factor = Parameter(
-                    shape=(experts_per_node, 1), dtype=dtype)
+                self.prequant_scaling_factor = Parameter(shape=(1, in_features),
+                                                         dtype=dtype)
             else:
                 self.register_parameter('prequant_scaling_factor', None)
             if groupwise_quant_algo & GroupwiseQuantAlgo.W4A8_ALPHA:
@@ -692,7 +703,7 @@ class MOEWeightWrapper(Module):
             weights = stack_weights(tllm_key, weights)
         if tllm_key.endswith("weights_block_scaling_factor_interleaved"):
             weights = stack_weights(tllm_key, weights)
-            weights = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            weights = torch.ops.trtllm.block_scale_interleave(
                 weights.to(torch.float8_e4m3fn).view(
                     torch.uint8).cpu().contiguous()).reshape(
                         weights.shape).view(torch.float8_e4m3fn)
@@ -768,7 +779,7 @@ class MixtureOfExperts(Module):
         self.use_int8_weight = use_int8_weight
         self.group_size = group_size
 
-        if self.use_int8_weight:
+        if self.use_int8_weight and self.group_size > 0:
             raise NotImplementedError("INT8-GPTQ is not implemented for MoE.")
 
         self.static_routing = static_routing

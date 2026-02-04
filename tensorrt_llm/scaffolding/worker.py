@@ -1,15 +1,18 @@
+import asyncio
+import copy
 from abc import ABC
-from typing import Callable
+from typing import Callable, Optional
 
 import openai
 from transformers import AutoTokenizer
 
-from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.llmapi.llm import LLM
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm import LLM
+from tensorrt_llm.executor import GenerationExecutor, GenerationResult
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .task import GenerationTask, Task, TaskStatus
+from .result import ScaffoldingOutput
+from .task import GenerationTask, StreamGenerationTask, Task, TaskStatus
 
 ExecutorCls = GenerationExecutor
 
@@ -73,15 +76,29 @@ class OpenaiWorker(Worker):
             "model": self.model,
             "prompt": task.input_str,
         }
+        add_param_if_not_none(params, "best_of", [task.best_of])
+        add_param_if_not_none(params, "echo", [task.echo])
+        add_param_if_not_none(params, "frequency_penalty",
+                              [task.frequency_penalty])
+        add_param_if_not_none(params, "logit_bias", [task.logit_bias])
+        add_param_if_not_none(params, "logprobs", [task.num_logprobs])
         add_param_if_not_none(params, "max_tokens", [task.max_tokens])
+        add_param_if_not_none(params, "n", [task.n])
+        add_param_if_not_none(params, "presence_penalty",
+                              [task.presence_penalty])
+        add_param_if_not_none(params, "seed", [task.seed])
+        add_param_if_not_none(params, "stop", [task.stop])
+        add_param_if_not_none(params, "suffix", [task.suffix])
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
+        add_param_if_not_none(params, "user", [task.user])
+
         return params
 
     def fill_generation_task_with_response(self, task: GenerationTask,
                                            response: openai.Completion):
         task.output_str = response.choices[0].text
-        task.logprobs = response.choices[0].logprobs
+        task.output_tokens = response.choices[0].token_ids
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         params = self.convert_task_params(task)
@@ -136,7 +153,11 @@ class TRTLLMWorker(Worker):
         max_num_tokens: int = 4096,
         kv_cache_free_gpu_memory_fraction: float = 0.9,
         disable_overlap_scheduler: bool = False,
+        scheduler_config: Optional[SchedulerConfig] = None,
     ):
+        if scheduler_config is None:
+            scheduler_config = SchedulerConfig()
+
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
 
@@ -150,13 +171,12 @@ class TRTLLMWorker(Worker):
         )
 
         llm = LLM(model_dir,
-                  backend=backend,
                   tokenizer=tokenizer,
-                  mixed_sampler=True,
                   disable_overlap_scheduler=disable_overlap_scheduler,
                   kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
-                  max_num_tokens=max_num_tokens)
+                  max_num_tokens=max_num_tokens,
+                  scheduler_config=scheduler_config)
 
         worker = cls(llm, tokenizer)
         worker.own_llm = True
@@ -168,26 +188,80 @@ class TRTLLMWorker(Worker):
             temperature=task.temperature,
             top_p=task.top_p,
             top_k=task.top_k,
-            return_context_logits=task.return_context_logits)
+            return_context_logits=task.return_context_logits,
+            logprobs=task.num_logprobs)
         return sampling_params
+
+    async def streaming_generate_helper(self, generate_result, step_at_least,
+                                        streaming_output_list):
+        step = 0
+        while not generate_result._done:
+            async_task = asyncio.create_task(generate_result._aresult_step())
+            if step_at_least and step >= step_at_least and not async_task.done(
+            ):
+                async_task.cancel()
+                break
+            await async_task
+            step += 1
+            # do not put the last token to the streaming_output_list
+            if streaming_output_list is not None and not generate_result._done:
+                streaming_output_list.append(
+                    ScaffoldingOutput(
+                        generate_result.outputs[0].text,
+                        copy.deepcopy(generate_result.outputs[0].token_ids)))
+
+    def fill_task_with_result(self, task: GenerationTask,
+                              result: GenerationResult):
+        task.output_str = result.outputs[0].text
+        task.output_tokens = result.outputs[0].token_ids
+        task.context_logits = result.context_logits
+        task.logprobs = result.outputs[0].logprobs
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         sampling_params = self.convert_task_params(task)
 
-        result = await self.llm.generate_async(task.input_str,
-                                               sampling_params=sampling_params)
-
-        task.output_tokens = result.outputs[0].token_ids
-        task.cumulative_logprob = result.outputs[0].cumulative_logprob
-        task.logprobs = result.outputs[0].logprobs
-        task.output_str = result.outputs[0].text
-        task.context_logits = result.context_logits
+        if task.streaming_output_flag:
+            result = self.llm.generate_async(task.input_str,
+                                             sampling_params=sampling_params,
+                                             streaming=True)
+            await self.streaming_generate_helper(result, None,
+                                                 task.streaming_output_list)
+        else:
+            result = await self.llm.generate_async(
+                task.input_str, sampling_params=sampling_params)
+        #task.result = result
+        self.fill_task_with_result(task, result)
 
         # TODO: error handle
+        return TaskStatus.SUCCESS
+
+    async def stream_generation_handler(
+            self, task: StreamGenerationTask) -> TaskStatus:
+        sampling_params = self.convert_task_params(task)
+        if task.request_handle is None:
+            task.request_handle = self.llm.generate_async(
+                task.input_str, sampling_params=sampling_params, streaming=True)
+
+        if task.cancel_flag:
+            task.end_flag = True
+            task.request_handle.abort()
+            return TaskStatus.SUCCESS
+
+        await self.streaming_generate_helper(
+            task.request_handle, task.streaming_step,
+            task.streaming_output_queue if task.streaming_output_flag else None)
+
+        self.fill_task_with_result(task, task.request_handle)
+
+        if task.request_handle._done:
+            task.end_flag = True
         return TaskStatus.SUCCESS
 
     def shutdown(self):
         if self.own_llm:
             self.llm.shutdown()
 
-    task_handlers = {GenerationTask: generation_handler}
+    task_handlers = {
+        GenerationTask: generation_handler,
+        StreamGenerationTask: stream_generation_handler
+    }

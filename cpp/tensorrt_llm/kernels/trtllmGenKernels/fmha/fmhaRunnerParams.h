@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -143,10 +146,14 @@ enum class TileScheduler
 
 enum class MultiCtasKvMode
 {
-    // No multiCtasKvMode.
+    // Disable the multiCtasKvMode.
     Disabled = 0,
     // Do the reduction through the global memory and atomic counters.
     GmemReduction,
+    // Same as GmemReduction, but use a separate kernel for the reduction.
+    // It is only supported/needed for 2-CTA or 1-CTA keepsMmaAbForGeneration MLA kernels with large
+    // reduction tiles.
+    GmemReductionWithSeparateKernel,
     // Do the reduction through the CGA remote shared memory.
     CgaSmemReduction
 };
@@ -167,6 +174,7 @@ inline bool isMultiCtasKvEnabled(MultiCtasKvMode multiCtasKvMode)
 
 MULTI_CTAS_KV_MODE_FUNCTION(Disabled)
 MULTI_CTAS_KV_MODE_FUNCTION(GmemReduction)
+MULTI_CTAS_KV_MODE_FUNCTION(GmemReductionWithSeparateKernel)
 MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 #undef MULTI_CTAS_KV_MODE_FUNCTION
@@ -185,6 +193,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Use block sparse attention.
+    bool mUseBlockSparseAttention;
 
     // Input QKV buffers.
     void const* qPtr;
@@ -192,18 +202,20 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Packed KV scaling factor buffer
+    void const* kvSfPtr;
     // Packed QKV buffer
     void const* qkvPtr;
-    // The scaling factor pointer of K.
-    void const* kSfBasePtr;
-    // The scaling factor pointer of V.
-    void const* vSfBasePtr;
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* attentionSinksPtr;
+    // The general packed custom mask ptr which does not meet specific format for trtllm gen kernels.
+    int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
-    uint32_t const* customMaskPtr;
+    uint32_t* customMaskPtr;
     // The packed custom mask's offsets of each sequence.
-    int64_t const* customMaskOffsetsPtr;
+    int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
-    int32_t const* firstSparseMaskOffsetsKvPtr;
+    int32_t* firstSparseMaskOffsetsKvPtr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -231,11 +243,15 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // The sequence lengths for Q.
+    int const* seqlensQPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
     // Head dimension for V.
     int mHeadDimV;
+    // Head dimension for Q/K non-RoPE part, only used for MLA now.
+    int mHeadDimQkNope;
     // Number of heads for Q and K/V.
     int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
     // The batch size.
@@ -267,11 +283,18 @@ struct TllmGenFmhaRunnerParams
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
     // batching is enabled.
     int mSfStartTokenIdx;
-
-    // The SF scale for Kv.
-    float mScaleSfKv;
+    // Skip softmax threshold scale factor.
+    float mSkipSoftmaxThresholdScaleFactor;
+    // Whether to use sparse MLA.
+    bool mSparseMla;
+    // The top k value for sparse MLA.
+    int mSparseMlaTopK;
     // The cuda stream.
     cudaStream_t stream;
+    // The layer index.
+    int32_t mLayerIdx = 0;
+    // Whether the spec-dec tree is used.
+    bool mIsSpecDecTree = false;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
@@ -313,16 +336,24 @@ struct TllmGenSelectKernelParams
     MultiCtasKvMode mMultiCtasKvMode;
     // Force using GmemRedution for the multiCtasKvMode.
     bool mForceGmemReduction;
+    // The mask type.
+    TrtllmGenAttentionMaskType mMaskType;
+    // The number of tokens per page.
+    int mNumTokensPerPage;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
     bool mSelectNewKernel;
     // The tile scheduler.
     TileScheduler mTileScheduler;
+    // The tile size for Q.
+    int mTileSizeQ;
     // The tile size for Kv.
     int mTileSizeKv;
     // Use 2 CTA MMA or not.
     bool mUses2CtaMma;
+    // Skips softmax or not.
+    bool mSkipsSoftmaxWhenPossible;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -331,12 +362,17 @@ struct TllmGenSelectKernelParams
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
         , mForceGmemReduction(false)
+        , mMaskType(params.mMaskType)
+        , mNumTokensPerPage(params.mNumTokensPerPage)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)
+        , mTileSizeQ(128)
         , mTileSizeKv(128)
-        , mUses2CtaMma(false){};
+        , mUses2CtaMma(false)
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

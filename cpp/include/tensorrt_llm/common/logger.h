@@ -22,9 +22,12 @@
 #include <string>
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 class Logger
@@ -54,20 +57,21 @@ public:
 
 #if defined(_MSC_VER)
     template <typename... Args>
-    void log(Level level, char const* format, Args const&... args);
+    void log(Level const level, char const* format, Args const&... args);
 
     template <typename... Args>
-    void log(Level level, int rank, char const* format, Args const&... args);
+    void log(Level const level, int const rank, char const* format, Args const&... args);
 #else
     template <typename... Args>
-    void log(Level level, char const* format, Args const&... args) __attribute__((format(printf, 3, 0)));
+    void log(Level const level, char const* format, Args const&... args) __attribute__((format(printf, 3, 0)));
 
     template <typename... Args>
-    void log(Level level, int rank, char const* format, Args const&... args) __attribute__((format(printf, 4, 0)));
+    void log(Level const level, int const rank, char const* format, Args const&... args)
+        __attribute__((format(printf, 4, 0)));
 #endif
 
     template <typename... Args>
-    void log(Level level, std::string const& format, Args const&... args)
+    void log(Level const level, std::string const& format, Args const&... args)
     {
         return log(level, format.c_str(), args...);
     }
@@ -124,17 +128,17 @@ private:
 
     static inline std::string getPrefix(Level const level)
     {
-        return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
+        return tensorrt_llm::common::fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
     }
 
     static inline std::string getPrefix(Level const level, int const rank)
     {
-        return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
+        return tensorrt_llm::common::fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
     }
 };
 
 template <typename... Args>
-void Logger::log(Logger::Level level, char const* format, Args const&... args)
+void Logger::log(Logger::Level const level, char const* format, Args const&... args)
 {
     if (isEnabled(level))
     {
@@ -170,6 +174,9 @@ void Logger::log(Logger::Level const level, int const rank, char const* format, 
         out << std::endl;
     }
 }
+} // namespace common
+
+TRTLLM_NAMESPACE_END
 
 #define TLLM_LOG(level, ...)                                                                                           \
     do                                                                                                                 \
@@ -187,4 +194,3 @@ void Logger::log(Logger::Level const level, int const rank, char const* format, 
 #define TLLM_LOG_WARNING(...) TLLM_LOG(tensorrt_llm::common::Logger::WARNING, __VA_ARGS__)
 #define TLLM_LOG_ERROR(...) TLLM_LOG(tensorrt_llm::common::Logger::ERROR, __VA_ARGS__)
 #define TLLM_LOG_EXCEPTION(ex, ...) tensorrt_llm::common::Logger::getLogger()->log(ex, ##__VA_ARGS__)
-} // namespace tensorrt_llm::common

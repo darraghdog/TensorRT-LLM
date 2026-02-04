@@ -115,6 +115,7 @@ def quant_cfg_choices():
     QUANT_CFG_CHOICES = {
         "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
         "fp8": mtq.FP8_DEFAULT_CFG,
+        "fp8_pc_pt": mtq.FP8_PER_CHANNEL_PER_TOKEN_CFG,
         "int4_awq": mtq.INT4_AWQ_CFG,
         "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
         "int8_wo": EMPTY_CFG,
@@ -284,7 +285,7 @@ def _get_llava_qwen_model(model_dir, dtype, device):
     if "hf" in model_dir:
         from transformers import LlavaOnevisionForConditionalGeneration
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype=dtype, device_map=device)
+            model_dir, dtype=dtype, device_map=device)
         model = model.language_model
     else:
         from llava.model.builder import load_pretrained_model
@@ -327,20 +328,20 @@ def get_model(ckpt_path: str,
         from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
                                                       device_map="cuda",
-                                                      torch_dtype=torch_dtype,
+                                                      dtype=torch_dtype,
                                                       trust_remote_code=True)
     elif model_type_is_enc_dec(hf_config.model_type):
         from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
                                                       device_map=device,
-                                                      torch_dtype=torch_dtype,
+                                                      dtype=torch_dtype,
                                                       trust_remote_code=True)
         model = EncDecModelWrapper(hf_model=model)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
             device_map=device_map if device != "cpu" else "cpu",
-            torch_dtype="auto",
+            dtype="auto",
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
@@ -512,6 +513,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
         "int8": "INT8_DEFAULT_CFG",
         "int8_sq": "INT8_SMOOTHQUANT_CFG",
         "fp8": "FP8_DEFAULT_CFG",
+        "fp8_pc_pt": "FP8_PER_CHANNEL_PER_TOKEN_CFG",
         "int4_awq": "INT4_AWQ_CFG",
         "w4a8_awq": "W4A8_AWQ_BETA_CFG",
     }
