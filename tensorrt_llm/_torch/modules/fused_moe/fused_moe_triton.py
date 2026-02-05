@@ -631,7 +631,21 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
     fc2_input_dequant: torch.Tensor
 
 
+_swizzle_call_count = 0
+
 def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
+    global _swizzle_call_count
+    _swizzle_call_count += 1
+    _log = _swizzle_call_count <= 4  # log first 2 layers (2 calls each)
+
+    def _mem(label=""):
+        if not _log:
+            return
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        resv = torch.cuda.memory_reserved() / 1024**3
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"  [swizzle #{_swizzle_call_count} {label}] alloc={alloc:.2f} resv={resv:.2f} peak={peak:.2f} GiB")
+
     # (num_experts, in_dim//2, out_dim)
     w_shape = w.shape
     # (num_experts, in_dim//32, out_dim)
@@ -640,15 +654,24 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
 
+    if _log:
+        w_bytes = w.nelement() * w.element_size() / 1024**3
+        print(f"  [swizzle #{_swizzle_call_count}] w.shape={list(w.shape)} w_size={w_bytes:.3f} GiB")
+
+    _mem("before maybe_update_stride")
+
     # OOM fix: save reference to original storage before maybe_update_stride
     # makes a copy. We free the original to make room for convert_layout output.
     original_w_storage = w.data.untyped_storage()
 
     w = maybe_update_stride(w)  # creates new tensor (transpose+contiguous+transpose)
+    _mem("after maybe_update_stride")
 
     # Free original parameter storage - maybe_update_stride already made a copy
     original_w_storage.resize_(0)
+    del original_w_storage
     torch.cuda.empty_cache()
+    _mem("after free original")
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
@@ -670,10 +693,19 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
             "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
 
     # w, w_scale = downcast_to_mxfp(tensor.to(torch.bfloat16), torch.uint8, axis=1)
+    _mem("before convert_layout(w)")
+    if _log:
+        torch.cuda.reset_peak_memory_stats()
     w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
                        **opt["value_layout_opts"])
+    _mem("after convert_layout(w)")
+    if _log:
+        cl_peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"  [swizzle #{_swizzle_call_count}] convert_layout(w) peak={cl_peak:.2f} GiB")
+
     w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"],
                              **opt["scale_layout_opts"])
+    _mem("after convert_layout(w_scale)")
     return w, w_scale
 
 
@@ -1127,7 +1159,24 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight_scale = shuffle_weight_for_activation_kernel(
             tmp_w3_w1_weight_scale)
 
-        # Handle w3_w1_weight
+        _log_lqs = _swizzle_call_count < 4  # log first 2 layers
+        if _log_lqs:
+            w3w1_bytes = module.w3_w1_weight.data.nelement() * module.w3_w1_weight.data.element_size() / 1024**3
+            w2_bytes = module.w2_weight.data.nelement() * module.w2_weight.data.element_size() / 1024**3
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            print(f"[load_quant_scales] w3w1={w3w1_bytes:.3f} w2={w2_bytes:.3f} GiB, GPU alloc={alloc:.2f} GiB")
+
+        # OOM fix: stage w2_weight to CPU while processing w3_w1_weight.
+        # Frees ~1 weight tensor of GPU memory during peak convert_layout call.
+        w2_cpu = module.w2_weight.data.cpu()
+        module.w2_weight.data.untyped_storage().resize_(0)
+        torch.cuda.empty_cache()
+
+        if _log_lqs:
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            print(f"[load_quant_scales] after w2 staged to CPU, GPU alloc={alloc:.2f} GiB")
+
+        # Handle w3_w1_weight (w2_weight GPU memory is now free)
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
             module.w3_w1_weight.data, tmp_w3_w1_weight_scale)
 
@@ -1137,18 +1186,34 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         _popped = module._parameters.pop('fc31_dequant', None)
         _popped.data.storage().resize_(0)
 
+        if _log_lqs:
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            print(f"[load_quant_scales] after w3w1 swizzle+pop, GPU alloc={alloc:.2f} GiB")
+
         module.w3_w1_weight = tmp_w3_w1_weight
         module.fc31_dequant = tmp_w3_w1_weight_scale
 
+        # Restore w2_weight from CPU for processing
+        w2_gpu = w2_cpu.cuda()
+        del w2_cpu
+
         # Handle w2_weight
         tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
-            module.w2_weight.data, tmp_w2_weight_scale)
+            w2_gpu, tmp_w2_weight_scale)
+        del w2_gpu
 
-        # Instantly release memory by resizing storage to 0 to avoid OOM
+        # Pop the now-empty w2_weight parameter and fc2_dequant
         _popped = module._parameters.pop('w2_weight', None)
-        _popped.data.storage().resize_(0)
+        if _popped is not None and _popped.data.untyped_storage().size() > 0:
+            _popped.data.untyped_storage().resize_(0)
         _popped = module._parameters.pop('fc2_dequant', None)
-        _popped.data.storage().resize_(0)
+        if _popped is not None:
+            _popped.data.untyped_storage().resize_(0)
+        torch.cuda.empty_cache()
+
+        if _log_lqs:
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            print(f"[load_quant_scales] after w2 swizzle+pop, GPU alloc={alloc:.2f} GiB")
 
         module.w2_weight = tmp_w2_weight
         module.fc2_dequant = tmp_w2_weight_scale
